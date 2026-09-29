@@ -256,6 +256,37 @@ input[type="range"]:disabled {
   cursor: default;
 }
 
+/* Scene editor */
+.scene-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.25fr;
+  gap: 6px;
+}
+
+.scene-buttons button {
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.selected {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 12px 0 4px;
+}
+
+.selected strong {
+  font-weight: 500;
+}
+
+.joint.size {
+  grid-template-columns: 96px 1fr 52px;
+}
+
+#grab.warn {
+  color: #a3261b;
+}
+
 .row {
   display: flex;
   align-items: center;

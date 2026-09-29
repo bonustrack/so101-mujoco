@@ -1,16 +1,29 @@
 <!-- Scene for the web demo. Derived from the Menagerie scene_box.xml: same arm,
-     floor and box material. The box is a 3 x 3 x 4 cm cube placed where a
-     top-down grasp reaches it: the SO-101 jaws hold it square and it weighs 36 g.
-     The site draws the scene with three.js, so the Menagerie visual settings are left out. -->
+     floor and box material. The site draws the scene with three.js, so the Menagerie
+     visual settings are left out.
+     Objects come from a fixed pool of 6 boxes and 6 balls (box0 to box5, ball0 to ball5),
+     so the page can add, move, resize and remove them without recompiling the model.
+     src/robot.ts hides the unused ones below the floor with collisions off, and sets each
+     object's size, mass and inertia at runtime (density 1000 kg/m³). At first only box0
+     is out: a 3 x 3 x 4 cm box of 36 g where a top-down grasp reaches it. -->
 <mujoco model="so101 web">
   <include file="so101.xml"/>
 
   <worldbody>
     <geom name="floor" size="0 0 0.05" type="plane"/>
-    <body name="box" pos="0.2 0.08 0.02">
-      <freejoint/>
-      <geom type="box" name="box" size="0.015 0.015 0.02" condim="3" friction="1 .03 .003" rgba="0.09 0.32 0.94 1"
-        contype="2" conaffinity="1" solref="0.01 1"/>
-    </body>
+    <replicate count="6" offset="0 -0.06 0">
+      <body name="box" pos="0.2 0.08 0.02">
+        <freejoint/>
+        <geom type="box" name="box" size="0.015 0.015 0.02" condim="3" friction="1 .03 .003" rgba="0.09 0.32 0.94 1"
+          solref="0.01 1"/>
+      </body>
+    </replicate>
+    <replicate count="6" offset="0 -0.06 0">
+      <body name="ball" pos="0.28 0.08 0.02">
+        <freejoint/>
+        <geom type="sphere" name="ball" size="0.02" condim="6" friction="1 .03 .003" rgba="0.94 0.42 0.12 1"
+          solref="0.01 1"/>
+      </body>
+    </replicate>
   </worldbody>
 </mujoco>

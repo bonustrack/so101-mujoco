@@ -1,14 +1,15 @@
 // The left panel: Jev key and model, the goal, Run and Stop, and a live log of every turn.
 import { MAX_TURNS, QUESTIONS, runAgent, type AgentEvent } from "./agent";
 import { askJev, listModels } from "./jev";
-import type { Robot } from "./robot";
+import type { Obj, Robot } from "./robot";
 
 const KEY = "jev-api-key";
 const MODEL = "jev-model";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const round = (n: number) => n.toFixed(2);
 
-export function setupAgent(robot: Robot, lock: (locked: boolean) => void) {
+// Jev's target is the selected object, else the first box, else the first object.
+export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (locked: boolean) => void) {
   const key = $<HTMLInputElement>("jev-key");
   const model = $<HTMLSelectElement>("jev-model");
   const goal = $<HTMLTextAreaElement>("goal");
@@ -24,12 +25,24 @@ export function setupAgent(robot: Robot, lock: (locked: boolean) => void) {
   // The log follows new turns only while the reader stays at its bottom.
   let follow = true;
   flow.onscroll = () => (follow = flow.scrollHeight - flow.scrollTop - flow.clientHeight < 40);
+  const target = () => robot.pickTarget(selected());
   const idle = () => {
-    run.disabled = controller !== null || !key.value.trim();
+    const next = target();
+    run.disabled = controller !== null || !key.value.trim() || !next || !!robot.tooBig(next);
     stopButton.disabled = controller === null;
+    randomize.disabled = !next;
   };
   const hint = () => {
-    if (!controller) status.textContent = key.value.trim() ? "Ready. Press Run." : "Paste a key, then press Run.";
+    if (controller) return;
+    const next = target();
+    const why = next && robot.tooBig(next);
+    status.textContent = !next
+      ? "Add a box or a ball, then press Run."
+      : why
+        ? `${next.label} is too big to grab: ${why}. Resize it or select another object.`
+        : key.value.trim()
+          ? `Ready. Press Run: Jev takes ${next.label}.`
+          : `Paste a key, then press Run. Jev takes ${next.label}.`;
   };
   const highlight = (stage: string | null) => stages.forEach((li) => li.classList.toggle("on", li.dataset.stage === stage));
 
@@ -66,8 +79,10 @@ export function setupAgent(robot: Robot, lock: (locked: boolean) => void) {
     hint();
   };
   model.onchange = () => localStorage.setItem(MODEL, model.value);
-  randomize.disabled = false;
-  randomize.onclick = () => robot.randomBox();
+  randomize.onclick = () => {
+    const next = controller ? robot.focus : target();
+    if (next?.active) robot.randomize(next);
+  };
   stopButton.onclick = () => stop();
   loadModels();
   idle();
@@ -80,7 +95,11 @@ export function setupAgent(robot: Robot, lock: (locked: boolean) => void) {
 
   run.onclick = async () => {
     const apiKey = key.value.trim();
-    if (!apiKey || controller) return;
+    const next = target();
+    if (!apiKey || controller || !next) return;
+    // The target stays the same for the whole run, whatever gets selected meanwhile.
+    robot.focus = next;
+    if (/^Take the (box|ball)$/.test(goal.value.trim())) goal.value = `Take the ${next.kind}`;
     controller = new AbortController();
     lock(true);
     idle();
@@ -151,13 +170,20 @@ export function setupAgent(robot: Robot, lock: (locked: boolean) => void) {
       signal: controller.signal,
       onEvent,
     });
+    lock(false); // before clearing the controller, so the end message stays up
     controller = null;
     highlight(null);
-    lock(false);
     idle();
   };
 
-  return { stop };
+  return {
+    stop,
+    // The scene changed: the target, Run and the hint may too.
+    refresh() {
+      idle();
+      hint();
+    },
+  };
 }
 
 const STAGE_TEXT: Record<string, string> = {
@@ -165,10 +191,10 @@ const STAGE_TEXT: Record<string, string> = {
   jev: "waiting for Jev",
   ik: "solving the joint angles",
   physics: "moving the arm",
-  check: "checking the box",
+  check: "checking the target",
 };
 const END_TEXT: Record<Extract<AgentEvent, { type: "end" }>["outcome"], string> = {
-  success: "Box taken.",
+  success: "Lifted.",
   done: "Jev stopped.",
   stopped: "Stopped.",
   turns: "Out of turns.",

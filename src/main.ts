@@ -3,7 +3,8 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import type { MainModule, MjModel } from "@mujoco/mujoco";
 import { setupAgent } from "./agent-ui";
-import { JOINTS, REST, createRobot, loadModel, type Robot } from "./robot";
+import { setupEditor, type Editor } from "./editor";
+import { JOINTS, REST, createRobot, loadModel, type Obj, type Robot } from "./robot";
 import "./style.css";
 
 // Poses in radians, one value per joint (from examples/so101.py).
@@ -102,6 +103,7 @@ controls.addEventListener("start", () => (framed = true));
 
 // Simulation state, set once MuJoCo is ready.
 let sim: Sim | null = null;
+let editor: Editor | null = null;
 let refreshControls = () => {};
 let last = performance.now();
 let budget = 0;
@@ -117,6 +119,7 @@ renderer.setAnimationLoop((now) => {
       budget -= robot.model.opt.timestep;
     }
     sim.sync();
+    editor?.frame();
     refreshControls();
   }
   controls.update();
@@ -130,8 +133,14 @@ loading
     $("loading").classList.add("hidden");
     const controls = buildControls(sim.robot);
     refreshControls = controls.refresh;
-    const agent = setupAgent(sim.robot, controls.lock);
+    let agent: ReturnType<typeof setupAgent> | null = null;
+    const edit = setupEditor({ robot: sim.robot, camera, canvas: renderer.domElement, scene, meshes: sim.meshes, onChange: () => agent?.refresh() });
+    agent = setupAgent(sim.robot, edit.selected, (locked) => {
+      controls.lock(locked);
+      edit.lock(locked);
+    });
     controls.onReset(agent.stop);
+    editor = edit;
   })
   .catch((error) => {
     console.error(error);
@@ -143,15 +152,22 @@ type Sim = ReturnType<typeof createSim>;
 function createSim(mujoco: MainModule, files: [string, Uint8Array][]) {
   const robot = createRobot(mujoco, loadModel(mujoco, files));
   const { root, items } = buildMeshes(mujoco, robot.model);
-  const { data } = robot;
+  const { model, data } = robot;
+  // The scene's boxes and balls, by object: the editor picks them, sync hides the unused ones.
+  const meshes = new Map<Obj, THREE.Object3D>();
+  const owner = new Map(robot.objects.map((o) => [o.geom, o]));
+  for (const { geom, object } of items) if (owner.has(geom)) meshes.set(owner.get(geom)!, object);
+  const scale = new THREE.Vector3();
   const sim = {
     robot,
     root,
-    // Copy every drawn geom's world pose from MuJoCo into its three.js object.
+    meshes,
+    // Copy every drawn geom's world pose from MuJoCo into its three.js object. Boxes and spheres
+    // are drawn at unit size and scaled here, so a resize shows at once.
     sync() {
       const pos = data.geom_xpos;
       const mat = data.geom_xmat;
-      for (const { geom, object } of items) {
+      for (const { geom, object, scaled } of items) {
         const p = 3 * geom;
         const r = 9 * geom;
         object.matrix.set(
@@ -160,6 +176,10 @@ function createSim(mujoco: MainModule, files: [string, Uint8Array][]) {
           mat[r + 6], mat[r + 7], mat[r + 8], pos[p + 2],
           0, 0, 0, 1,
         );
+        const s = model.geom_size;
+        if (scaled === "box") object.matrix.scale(scale.set(s[3 * geom], s[3 * geom + 1], s[3 * geom + 2]));
+        if (scaled === "sphere") object.matrix.scale(scale.setScalar(s[3 * geom]));
+        object.visible = owner.get(geom)?.active ?? true;
         object.matrixWorldNeedsUpdate = true;
       }
     },
@@ -173,7 +193,9 @@ function createSim(mujoco: MainModule, files: [string, Uint8Array][]) {
 function buildMeshes(mujoco: MainModule, model: MjModel) {
   const T = mujoco.mjtGeom;
   const root = new THREE.Group();
-  const items: { geom: number; object: THREE.Object3D }[] = [];
+  const items: { geom: number; object: THREE.Object3D; scaled?: "box" | "sphere" }[] = [];
+  const unitBox = new THREE.BoxGeometry(2, 2, 2);
+  const unitSphere = new THREE.SphereGeometry(1, 32, 24);
   const meshCache = new Map<number, THREE.BufferGeometry>();
   const materials = new Map<string, THREE.Material>();
 
@@ -182,16 +204,19 @@ function buildMeshes(mujoco: MainModule, model: MjModel) {
     const type = model.geom_type[g];
     const s = model.geom_size.subarray(3 * g, 3 * g + 3);
     let geometry: THREE.BufferGeometry;
+    let scaled: "box" | "sphere" | undefined;
     if (type === T.mjGEOM_MESH.value) {
       const id = model.geom_dataid[g];
       geometry = meshCache.get(id) ?? meshGeometry(model, id);
       meshCache.set(id, geometry);
     } else if (type === T.mjGEOM_BOX.value) {
-      geometry = new THREE.BoxGeometry(2 * s[0], 2 * s[1], 2 * s[2]);
+      geometry = unitBox;
+      scaled = "box";
     } else if (type === T.mjGEOM_CYLINDER.value) {
       geometry = new THREE.CylinderGeometry(s[0], s[0], 2 * s[1], 32).rotateX(Math.PI / 2);
     } else if (type === T.mjGEOM_SPHERE.value) {
-      geometry = new THREE.SphereGeometry(s[0], 24, 16);
+      geometry = unitSphere;
+      scaled = "sphere";
     } else if (type === T.mjGEOM_CAPSULE.value) {
       geometry = new THREE.CapsuleGeometry(s[0], 2 * s[1], 8, 24).rotateX(Math.PI / 2);
     } else {
@@ -213,7 +238,7 @@ function buildMeshes(mujoco: MainModule, model: MjModel) {
     mesh.castShadow = mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;
     root.add(mesh);
-    items.push({ geom: g, object: mesh });
+    items.push({ geom: g, object: mesh, scaled });
   }
   return { root, items };
 }

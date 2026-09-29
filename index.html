@@ -20,7 +20,7 @@
     <aside id="agent">
       <header>
         <h1>Jev takes the box</h1>
-        <p>Jev picks each command from what the arm sees, until the box is lifted.</p>
+        <p>Jev picks each command from what the arm sees, until the target is lifted: the selected object, or the first box.</p>
       </header>
 
       <section>
@@ -39,7 +39,7 @@
         <div class="buttons">
           <button id="run" type="button" class="primary" disabled>Run</button>
           <button id="stop" type="button" disabled>Stop</button>
-          <button id="randomize" type="button" disabled>Randomize box</button>
+          <button id="randomize" type="button" title="Move the target to a random spot in reach" disabled>Randomize</button>
         </div>
         <p id="status">Paste a key, then press Run.</p>
       </section>
@@ -57,7 +57,7 @@
         </ol>
         <details id="how" open>
           <summary>How the loop works</summary>
-          <p class="note">Code turns the scene into plain facts. Jev is a decision model, not a chat model: it picks the next of 7 commands, with a probability for each. Code solves the joint angles (IK) and MuJoCo moves the arm. Code checks success: box 5 cm up, held for 1 s. At most 12 turns.</p>
+          <p class="note">Code turns the scene into plain facts, with the target's type and size. Jev is a decision model, not a chat model: it picks the next of 7 commands, with a probability for each. Code solves the joint angles (IK) and MuJoCo moves the arm. Code checks success: target 5 cm up, held for 1 s. At most 12 turns.</p>
           <details>
             <summary>The question Jev answers</summary>
             <pre id="question"></pre>
@@ -87,8 +87,23 @@
         <div id="joints"></div>
       </section>
 
+      <section>
+        <h2>Scene</h2>
+        <div class="scene-buttons">
+          <button id="add-box" type="button" disabled>Add box</button>
+          <button id="add-ball" type="button" disabled>Add ball</button>
+          <button id="reset-scene" type="button" disabled>Reset scene</button>
+        </div>
+        <p id="scene-hint" class="note"><span class="mouse">Click an object to select it, drag it to move it. Arrow keys nudge it.</span><span class="touch">Tap an object to select it, drag it to move it.</span></p>
+        <div id="selection" hidden>
+          <div class="selected"><strong id="selected-name"></strong><button id="delete" type="button">Delete</button></div>
+          <div id="sizes"></div>
+          <p id="grab" class="note"></p>
+        </div>
+      </section>
+
       <div class="row">
-        <button id="reset" type="button" disabled>Reset</button>
+        <button id="reset" type="button" title="Arm back to rest, objects back where you placed them" disabled>Reset</button>
         <span id="clock">Not started</span>
       </div>
 

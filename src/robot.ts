@@ -20,10 +20,38 @@ export const OPEN = 0.8; // jaws about 7 cm apart
 export const CLOSED = -0.17; // fully shut: the jaw stalls on whatever is between them
 
 const ARM = 5; // shoulder pan to wrist roll; the IK moves these, never the gripper
-export const LIFTED = 0.05; // the box counts as lifted when its lowest corner is 5 cm above the table
+export const LIFTED = 0.05; // an object counts as lifted when its lowest point is 5 cm above the table
 
 export type Vec3 = [number, number, number];
 export type Robot = ReturnType<typeof createRobot>;
+
+// Objects come from a fixed pool in scene_web.xml (box0 to box5, ball0 to ball5), so the
+// scene can change without recompiling: unused ones wait below the floor with collisions off.
+export type Kind = "box" | "ball";
+export const POOL = 6; // objects of each kind
+export type Obj = {
+  kind: Kind;
+  label: string; // "Box 1"
+  body: number;
+  geom: number;
+  qpos: number;
+  dof: number;
+  bvh: number;
+  size: Vec3; // half extents in metres; a ball's three values are its radius
+  active: boolean;
+  home: [number, number, number]; // x, y and yaw that Reset puts it back to
+  order: number; // when it was added, so "the first box" is well defined
+};
+const DENSITY = 1000; // kg/m³: the 3 x 3 x 4 cm box weighs 36 g
+export const DEFAULT_SIZE: Record<Kind, Vec3> = { box: [0.015, 0.015, 0.02], ball: [0.02, 0.02, 0.02] };
+export const SIZE_RANGE = [0.01, 0.04]; // half extents: 2 to 8 cm across, the smallest the jaws still hold
+// Grab limits, measured with scripted picks: the open jaws take a box side up to 6 cm, and fingers-down
+// reach needs a box at most 6 cm high. Balls of every size in range work: the jaws close around them.
+export const JAWS = 0.06;
+export const TALLEST = 0.06;
+const FIRST_BOX: [number, number, number] = [0.2, 0.08, 0]; // where the scene's first box starts
+const PARKED = [0, 0, -1, 1, 0, 0, 0]; // unused objects: 1 m below the floor, collisions off
+const DRAG_LIFT = 0.004; // a dragged object floats 4 mm above the table
 
 // Files are [name, bytes] pairs: scene_web.xml, so101.xml and the meshes under assets/.
 export function loadModel(mujoco: MainModule, files: [string, Uint8Array][]) {
@@ -54,22 +82,80 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   const tcp = id(obj.mjOBJ_SITE, "gripperframe"); // between the jaw tips
   const hand = id(obj.mjOBJ_BODY, "gripper"); // fixed jaw; +z runs from the tips up the wrist, +x toward the moving jaw
   const jaw = id(obj.mjOBJ_BODY, "moving_jaw_so101_v1");
-  const boxBody = id(obj.mjOBJ_BODY, "box");
-  const boxGeom = id(obj.mjOBJ_GEOM, "box");
-  const boxQpos = model.jnt_qposadr[model.body_jntadr[boxBody]] as number;
-  const boxDof = model.jnt_dofadr[model.body_jntadr[boxBody]] as number;
-  const boxSize = Array.from(model.geom_size.subarray(3 * boxGeom, 3 * boxGeom + 3)) as Vec3;
   const jacp = new mujoco.DoubleBuffer(3 * model.nv);
   const jacr = new mujoco.DoubleBuffer(3 * model.nv);
 
+  const objects: Obj[] = (["box", "ball"] as const).flatMap((kind) =>
+    Array.from({ length: POOL }, (_, i) => {
+      const body = id(obj.mjOBJ_BODY, `${kind}${i}`);
+      const joint = model.body_jntadr[body];
+      return {
+        kind,
+        label: `${kind === "box" ? "Box" : "Ball"} ${i + 1}`,
+        body,
+        geom: model.body_geomadr[body] as number,
+        qpos: model.jnt_qposadr[joint] as number,
+        dof: model.jnt_dofadr[joint] as number,
+        bvh: model.body_bvhadr[body] as number,
+        size: [...DEFAULT_SIZE[kind]] as Vec3,
+        active: false,
+        home: [0, 0, 0] as [number, number, number],
+        order: 0,
+      };
+    }),
+  );
+  // The arm's collision geoms, which a new object must not land on.
+  const armGeoms = Array.from({ length: model.ngeom }, (_, g) => g).filter(
+    (g) => model.geom_bodyid[g] > 0 && !objects.some((o) => o.geom === g) && (model.geom_contype[g] || model.geom_conaffinity[g]),
+  );
+  let added = 0;
+  let dragged: { o: Obj; pose: number[] } | null = null;
   let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void } | null = null;
+
+  // Write a free joint's pose (x y z and quaternion) and stop it.
+  const pin = (o: Obj, pose: number[]) => {
+    data.qpos.set(pose, o.qpos);
+    data.qvel.fill(0, o.dof, o.dof + 6);
+  };
+  const upright = (o: Obj, x: number, y: number, yaw: number, lift: number) => [
+    x,
+    y,
+    o.size[2] + lift,
+    Math.cos(yaw / 2),
+    0,
+    0,
+    Math.sin(yaw / 2),
+  ];
+  const collide = (o: Obj, on: boolean) => {
+    const v = on ? 1 : 0;
+    model.geom_contype[o.geom] = model.geom_conaffinity[o.geom] = v;
+    model.body_contype[o.body] = model.body_conaffinity[o.body] = v;
+  };
+  // Size, bounds, mass and inertia together, then the constants that depend on mass.
+  // setConst runs on the IK scratch data, so the live state is untouched.
+  const setSize = (o: Obj, size: Vec3) => {
+    const [a, b, c] = (o.size = o.kind === "ball" ? [size[0], size[0], size[0]] : ([...size] as Vec3));
+    model.geom_size.set(o.size, 3 * o.geom);
+    model.geom_rbound[o.geom] = o.kind === "box" ? Math.hypot(a, b, c) : a;
+    model.geom_aabb.set([0, 0, 0, a, b, c], 6 * o.geom);
+    model.bvh_aabb.set([0, 0, 0, a, b, c], 6 * o.bvh);
+    const mass = DENSITY * (o.kind === "box" ? 8 * a * b * c : (4 / 3) * Math.PI * a ** 3);
+    model.body_mass[o.body] = mass;
+    model.body_inertia.set(
+      o.kind === "box" ? [(b * b + c * c) / 3, (a * a + c * c) / 3, (a * a + b * b) / 3].map((k) => k * mass) : [0.4 * mass * a * a, 0.4 * mass * a * a, 0.4 * mass * a * a],
+      3 * o.body,
+    );
+    mujoco.mj_setConst(model, scratch);
+  };
 
   const robot = {
     mujoco,
     model,
     data,
     range,
-    boxSize,
+    objects,
+    // The object the pick commands, the observation and the success check work on.
+    focus: null as Obj | null,
     target: [...REST],
     setCtrl(values: number[]) {
       values.forEach((v, i) => {
@@ -79,8 +165,10 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     },
     joints: () => actuators.map(({ qpos }) => data.qpos[qpos] as number),
 
-    // One physics step. A running motion sets the actuator targets first.
+    // One physics step. Unused and dragged objects are held in place; a running motion sets the actuator targets.
     step() {
+      for (const o of objects) if (!o.active) pin(o, PARKED);
+      if (dragged) pin(dragged.o, dragged.pose);
       if (motion) {
         const t = data.time - motion.start;
         const k = Math.min(t / motion.duration, 1);
@@ -113,47 +201,145 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       done?.();
     },
 
+    // Arm back to rest and every object back to where it was placed.
     reset() {
       robot.cancel();
+      dragged = null;
       mujoco.mj_resetData(model, data);
       actuators.forEach(({ qpos }, i) => (data.qpos[qpos] = REST[i]));
       robot.setCtrl(REST);
+      for (const o of objects) pin(o, o.active ? upright(o, ...o.home, 0.001) : PARKED);
       mujoco.mj_forward(model, data);
     },
-    // Put the box somewhere on the table, upright, turned by `yaw` radians.
-    placeBox(x: number, y: number, yaw: number) {
-      const q = data.qpos;
-      q[boxQpos] = x;
-      q[boxQpos + 1] = y;
-      q[boxQpos + 2] = boxSize[2] + 0.001;
-      q[boxQpos + 3] = Math.cos(yaw / 2);
-      q[boxQpos + 4] = 0;
-      q[boxQpos + 5] = 0;
-      q[boxQpos + 6] = Math.sin(yaw / 2);
-      for (let i = 0; i < 6; i++) data.qvel[boxDof + i] = 0;
+    // Back to the first scene: one 3 x 3 x 4 cm box.
+    resetScene() {
+      dragged = null;
+      for (const o of objects) robot.remove(o);
+      const box = robot.add("box")!;
+      robot.place(box, ...FIRST_BOX);
+    },
+
+    // Scene editing. Every change runs mj_forward, so the drawing and the facts follow at once.
+    active: () => objects.filter((o) => o.active).sort((a, b) => a.order - b.order),
+    // The next free object of that kind, dropped from 2 cm onto a clear spot in reach, or from above the
+    // others when the table is full. Null when all 6 are out.
+    add(kind: Kind) {
+      const o = objects.find((o) => o.kind === kind && !o.active);
+      if (!o) return null;
+      setSize(o, DEFAULT_SIZE[kind]);
+      o.active = true;
+      o.order = ++added;
+      collide(o, true);
+      const { x, y, room } = robot.clearSpot(o);
+      const tops = robot.active().map((other) => (other === o ? 0 : robot.object(other).top));
+      robot.place(o, x, y, 0, room > 0 ? 0.02 : Math.max(...tops) + 0.01);
+      return o;
+    },
+    remove(o: Obj) {
+      o.active = false;
+      collide(o, false);
+      if (dragged?.o === o) dragged = null;
+      if (robot.focus === o) robot.focus = null;
+      pin(o, PARKED);
       mujoco.mj_forward(model, data);
     },
-    // A random spot in front of the arm that a top-down grasp can reach, clear of the arm:
-    // the folded arm's jaws rest inside this area, and a box dropped into them reads as held.
-    randomBox(random = Math.random) {
-      for (let tries = 0; tries < 20; tries++) {
+    // New half extents. The object keeps its spot and its lowest point, so it never sinks into the table.
+    resize(o: Obj, size: Vec3) {
+      const before = robot.object(o).bottom;
+      setSize(o, size);
+      data.qpos[o.qpos + 2] += before - robot.object(o).bottom;
+      data.qvel.fill(0, o.dof, o.dof + 6);
+      mujoco.mj_forward(model, data);
+    },
+    // Put an object upright at (x, y), turned by `yaw` radians, `lift` above the table. Reset brings it back here.
+    place(o: Obj, x: number, y: number, yaw: number, lift = 0.001) {
+      o.home = [x, y, yaw];
+      pin(o, upright(o, x, y, yaw, lift));
+      mujoco.mj_forward(model, data);
+    },
+    // Hold an object upright just above the table at (x, y) while the pointer drags it: the physics
+    // keeps running around it, and it pushes what it meets. drop() lets it fall and settle.
+    drag(o: Obj, x: number, y: number) {
+      const yaw = dragged?.o === o ? robot.object(o).yaw : o.kind === "box" ? robot.object(o).yaw : 0;
+      dragged = { o, pose: upright(o, x, y, yaw, DRAG_LIFT) };
+      pin(o, dragged.pose);
+      mujoco.mj_forward(model, data);
+    },
+    drop() {
+      if (!dragged) return;
+      const { o, pose } = dragged;
+      dragged = null;
+      o.home = [pose[0], pose[1], robot.object(o).yaw];
+      data.qvel.fill(0, o.dof, o.dof + 6);
+    },
+    // How much room `o` would have at (x, y): the gap to the nearest other object or arm part it could touch.
+    // Negative when it would overlap one. The arm counts where it stands now.
+    roomFinder(o: Obj) {
+      const height = 2 * o.size[2] + 0.03;
+      const obstacles = [
+        ...robot.active().flatMap((other) => (other === o ? [] : [[...robot.object(other).pos, robot.footprint(other)]])),
+        ...armGeoms.flatMap((g) => {
+          const p = data.geom_xpos.subarray(3 * g, 3 * g + 3);
+          const r = model.geom_rbound[g];
+          return p[2] - r < height ? [[p[0], p[1], p[2], r]] : [];
+        }),
+      ];
+      return (x: number, y: number) => Math.min(...obstacles.map(([ox, oy, , r]) => Math.hypot(ox - x, oy - y) - r - robot.footprint(o)));
+    },
+    // A reachable spot with 1 cm to spare, going outward from the front of the arm, else the one with the most room.
+    clearSpot(o: Obj) {
+      const room = robot.roomFinder(o);
+      let best = { x: 0.2, y: 0, room: -Infinity };
+      for (const r of [0.2, 0.17, 0.23, 0.14, 0.26])
+        for (let i = 0; i <= 10; i++) {
+          const a = (i % 2 ? 1 : -1) * Math.ceil(i / 2) * 0.2; // 0, then ±0.2 rad outward to ±1
+          const spot = { x: r * Math.cos(a), y: r * Math.sin(a), room: room(r * Math.cos(a), r * Math.sin(a)) };
+          if (spot.room >= 0.01) return spot;
+          if (spot.room > best.room) best = spot;
+        }
+      return best;
+    },
+    // A random clear spot in front of the arm that a top-down grasp can reach, turned at random.
+    randomize(o: Obj, random = Math.random) {
+      const room = robot.roomFinder(o);
+      let best = { x: 0.2, y: 0, room: -Infinity };
+      for (let i = 0; i < 50 && best.room < 0.005; i++) {
         const r = 0.16 + 0.08 * random();
         const a = (random() - 0.5) * 1.6;
-        robot.placeBox(r * Math.cos(a), r * Math.sin(a), (random() - 0.5) * Math.PI);
-        if (!robot.contacts().arm) return;
+        const spot = { x: r * Math.cos(a), y: r * Math.sin(a), room: room(r * Math.cos(a), r * Math.sin(a)) };
+        if (spot.room > best.room) best = spot;
       }
+      robot.place(o, best.x, best.y, (random() - 0.5) * Math.PI);
+    },
+    // Radius of the circle it covers on the table, standing upright.
+    footprint: (o: Obj) => (o.kind === "ball" ? o.size[0] : Math.hypot(o.size[0], o.size[1])),
+    // Jev's target: the selected object, else the first box, else the first object.
+    pickTarget(selected: Obj | null) {
+      const active = robot.active();
+      return selected?.active ? selected : (active.find((o) => o.kind === "box") ?? active[0] ?? null);
+    },
+    // Why the arm cannot grab it, or null when it can.
+    tooBig(o: Obj) {
+      if (o.kind === "ball") return null;
+      if (2 * Math.min(o.size[0], o.size[1]) > JAWS + 1e-9) return `every side is over ${JAWS * 100} cm, wider than the open jaws`;
+      if (2 * o.size[2] > TALLEST + 1e-9) return `over ${TALLEST * 100} cm high, out of reach from above`;
+      return null;
     },
 
     // Scene facts, all computed from the physics state.
-    box() {
-      const p = data.xpos.subarray(3 * boxBody, 3 * boxBody + 3);
-      const R = data.xmat.subarray(9 * boxBody, 9 * boxBody + 9);
-      // Lowest corner: half-extents projected on the vertical.
-      const bottom = p[2] - (Math.abs(R[6]) * boxSize[0] + Math.abs(R[7]) * boxSize[1] + Math.abs(R[8]) * boxSize[2]);
+    object(target?: Obj) {
+      const o = target ?? robot.focus!;
+      const p = data.xpos.subarray(3 * o.body, 3 * o.body + 3);
+      const R = data.xmat.subarray(9 * o.body, 9 * o.body + 9);
+      const [a, b, c] = o.size;
+      const ball = o.kind === "ball";
+      // Lowest point: half extents projected on the vertical.
+      const bottom = p[2] - (ball ? a : Math.abs(R[6]) * a + Math.abs(R[7]) * b + Math.abs(R[8]) * c);
       return {
         pos: [p[0], p[1], p[2]] as Vec3,
-        yaw: Math.atan2(R[3], R[0]),
-        upright: R[8] > 0.95,
+        // A ball has no faces: the jaws line up with the direction from the base instead.
+        yaw: ball ? Math.atan2(p[1], p[0]) : Math.atan2(R[3], R[0]),
+        upright: ball || R[8] > 0.95,
         bottom,
         top: 2 * p[2] - bottom,
       };
@@ -161,28 +347,29 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     tcp: () => Array.from(data.site_xpos.subarray(3 * tcp, 3 * tcp + 3)) as Vec3,
     // Direction the jaws close along, as a heading in radians.
     handYaw: () => Math.atan2(data.xmat[9 * hand + 3], data.xmat[9 * hand]),
-    // Which jaws touch the box right now, and whether any part of the arm does.
+    // Which jaws touch the target right now, and whether any part of the arm does.
     contacts() {
       let fixed = false;
       let moving = false;
       let arm = false;
+      const geom = robot.focus?.geom ?? -1;
       for (let i = 0; i < data.ncon; i++) {
         const c = data.contact.get(i);
         if (!c) continue;
-        const other = c.geom1 === boxGeom ? c.geom2 : c.geom2 === boxGeom ? c.geom1 : -1;
+        const other = c.geom1 === geom ? c.geom2 : c.geom2 === geom ? c.geom1 : -1;
         if (other >= 0) {
           const body = model.geom_bodyid[other];
           if (body === hand) fixed = true;
           if (body === jaw) moving = true;
-          if (body !== 0) arm = true; // body 0 is the world: the floor
+          if (armGeoms.includes(other)) arm = true;
         }
         c.delete();
       }
       return { fixed, moving, arm };
     },
-    // Box centre in the hand frame: x across the jaws, z along the fingers (tips near z = -0.1).
-    boxInHand() {
-      const p = data.xpos.subarray(3 * boxBody, 3 * boxBody + 3);
+    // Target centre in the hand frame: x across the jaws, z along the fingers (tips near z = -0.1).
+    objectInHand() {
+      const p = robot.object().pos;
       const o = data.xpos.subarray(3 * hand, 3 * hand + 3);
       const R = data.xmat.subarray(9 * hand, 9 * hand + 9);
       const d = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
@@ -191,7 +378,7 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     // Lifted and held: code decides success, not the model.
     held() {
       const { fixed, moving } = robot.contacts();
-      return robot.box().bottom >= LIFTED && fixed && moving;
+      return robot.object().bottom >= LIFTED && fixed && moving;
     },
 
     // Inverse kinematics: arm joints that put the jaw tips at `pos` with the fingers pointing
@@ -241,18 +428,35 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       const q = actuators.slice(0, ARM).map(({ qpos }) => scratch.qpos[qpos] as number);
       return { q, miss: Math.hypot(pos[0] - p[0], pos[1] - p[1], pos[2] - p[2]), error };
     },
-    // The jaw direction that matches a box face and needs the least wrist roll from here.
-    graspYaw(pos: Vec3, boxYaw: number) {
-      let best = { q: [] as number[], miss: Infinity, yaw: 0, cost: Infinity };
+    // The target's width between jaws that close along `yaw`: its x side, or its y side a quarter turn later.
+    across(yaw: number) {
+      const o = robot.focus!;
+      const k = Math.abs(Math.round((yaw - robot.object().yaw) / (Math.PI / 2))) % 2;
+      return 2 * o.size[k];
+    },
+    // Where the jaw tips go to grip the target at height `z`, jaws closing along `yaw`. The tips sit
+    // nearer the fixed jaw, so a wide object is gripped off centre to clear that jaw by 5 mm.
+    gripPoint(yaw: number, z: number): Vec3 {
+      const [x, y] = robot.object().pos;
+      const shift = Math.max(0, robot.across(yaw) / 2 - 0.015);
+      return [x - shift * Math.cos(yaw), y - shift * Math.sin(yaw), z];
+    },
+    // The jaw direction that matches a face of the target, fits between the open jaws and needs the
+    // least wrist roll from here, with the tip position for it at height `z`.
+    graspYaw(z: number) {
+      const faceYaw = robot.object().yaw;
+      let best = { q: [] as number[], miss: Infinity, yaw: 0, pos: [0, 0, 0] as Vec3, cost: Infinity };
       for (let k = 0; k < 4; k++) {
-        const yaw = boxYaw + (k * Math.PI) / 2;
+        const yaw = faceYaw + (k * Math.PI) / 2;
+        const pos = robot.gripPoint(yaw, z);
         const s = robot.solve(pos, yaw, [Math.atan2(pos[1], pos[0]), 0, 0, 1.2, 0]);
-        const cost = s.error + 0.01 * Math.abs(s.q[4]);
-        if (cost < best.cost) best = { ...s, yaw, cost };
+        const cost = s.error + 0.01 * Math.abs(s.q[4]) + (robot.across(yaw) > JAWS + 1e-9 ? 1 : 0);
+        if (cost < best.cost) best = { ...s, yaw, pos, cost };
       }
       return best;
     },
   };
+  robot.resetScene();
   robot.reset();
   return robot;
 }

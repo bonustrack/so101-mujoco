@@ -17,6 +17,60 @@
       <p class="hint"><span class="mouse">Drag to orbit, scroll to zoom</span><span class="touch">Drag to orbit, pinch to zoom</span></p>
     </main>
 
+    <aside id="agent">
+      <header>
+        <h1>Jev takes the box</h1>
+        <p>Jev picks each command from what the arm sees, until the box is lifted.</p>
+      </header>
+
+      <section>
+        <h2>Jev</h2>
+        <div class="field">
+          <input id="jev-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your TypeSafe API key" aria-label="Jev API key" />
+          <button id="jev-clear" type="button">Clear</button>
+        </div>
+        <select id="jev-model" aria-label="Model"><option>jev-latest</option></select>
+        <p class="note">The key stays in this browser. Calls go through this site's Netlify Function, because TypeSafe blocks browser calls. It passes the key on and never stores or logs it.</p>
+      </section>
+
+      <section>
+        <h2>Goal</h2>
+        <textarea id="goal" rows="2" spellcheck="false" aria-label="Goal">Take the box</textarea>
+        <div class="buttons">
+          <button id="run" type="button" class="primary" disabled>Run</button>
+          <button id="stop" type="button" disabled>Stop</button>
+          <button id="randomize" type="button" disabled>Randomize box</button>
+        </div>
+        <p id="status">Paste a key, then press Run.</p>
+      </section>
+
+      <section>
+        <h2>How it works</h2>
+        <ol id="diagram" aria-label="The loop">
+          <li data-stage="goal">Goal</li>
+          <li data-stage="observe">Observe</li>
+          <li data-stage="jev">Jev</li>
+          <li data-stage="command">Command</li>
+          <li data-stage="ik">IK</li>
+          <li data-stage="physics">Physics</li>
+          <li data-stage="check">Check</li>
+        </ol>
+        <details id="how" open>
+          <summary>How the loop works</summary>
+          <p class="note">Code turns the scene into plain facts. Jev is a decision model, not a chat model: it picks the next of 7 commands, with a probability for each. Code solves the joint angles (IK) and MuJoCo moves the arm. Code checks success: box 5 cm up, held for 1 s. At most 12 turns.</p>
+          <details>
+            <summary>The question Jev answers</summary>
+            <pre id="question"></pre>
+          </details>
+        </details>
+      </section>
+
+      <section class="flow">
+        <h2>Flow</h2>
+        <ol id="flow"><li class="empty">Each turn shows up here: what Jev saw, what it chose, what the arm did.</li></ol>
+      </section>
+    </aside>
+
     <aside id="panel">
       <header>
         <h1>SO-101</h1>

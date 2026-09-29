@@ -1,21 +1,12 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-import type { MainModule, MjData, MjModel } from "@mujoco/mujoco";
+import type { MainModule, MjModel } from "@mujoco/mujoco";
+import { setupAgent } from "./agent-ui";
+import { JOINTS, REST, createRobot, loadModel, type Robot } from "./robot";
 import "./style.css";
 
-// One entry per position actuator, in the model's order.
-const JOINTS = [
-  ["shoulder_pan", "Shoulder pan"],
-  ["shoulder_lift", "Shoulder lift"],
-  ["elbow_flex", "Elbow flex"],
-  ["wrist_flex", "Wrist flex"],
-  ["wrist_roll", "Wrist roll"],
-  ["gripper", "Gripper"],
-] as const;
-
 // Poses in radians, one value per joint (from examples/so101.py).
-const REST = [0, -1.57, 1.57, 0.8, 0, 0];
 const POSES = [
   { name: "Rest", short: "Rest", ctrl: REST },
   { name: "Reach forward", short: "Forward", ctrl: [0, 0.6, -0.6, 0.4, 0, 1.2] },
@@ -86,18 +77,21 @@ controls.maxDistance = 3;
 controls.maxPolarAngle = Math.PI / 2 - 0.03;
 
 // Start from a 3/4 front-left view far enough back to fit every pose and the box.
-// On wide screens the panel floats on the right, so the view centre shifts left.
+// On wide screens the panels float left and right, so the view centres on the gap between them.
 let framed = false;
 function resize() {
   const { clientWidth: w, clientHeight: h } = view;
-  const panel = $("panel");
-  const shift = panel.offsetTop < h / 2 ? (panel.offsetWidth + 20) / 2 : 0;
+  const [left, right] = ["agent", "panel"].map((id) => {
+    const panel = $(id);
+    return getComputedStyle(panel).position === "fixed" ? panel.offsetWidth + 20 : 0;
+  });
+  const shift = (right - left) / 2;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.setViewOffset(w, h, shift, 0, w, h);
   if (!framed) {
     const half = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
-    const distance = Math.max(0.28 / half, (0.36 * h) / (half * (w - 2 * shift)));
+    const distance = Math.max(0.28 / half, (0.36 * h) / (half * Math.max(w - left - right, 200)));
     camera.position.copy(controls.target).addScaledVector(new THREE.Vector3(0.75, 0.45, 0.5).normalize(), distance);
     controls.update();
   }
@@ -109,7 +103,6 @@ controls.addEventListener("start", () => (framed = true));
 // Simulation state, set once MuJoCo is ready.
 let sim: Sim | null = null;
 let refreshControls = () => {};
-let tween: { from: number[]; to: number[]; start: number } | null = null;
 let last = performance.now();
 let budget = 0;
 
@@ -117,16 +110,11 @@ renderer.setAnimationLoop((now) => {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
   if (sim) {
-    if (tween) {
-      const k = Math.min((now - tween.start) / 1000 / MOVE_SECONDS, 1);
-      const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
-      sim.setCtrl(tween.from.map((a, i) => a + (tween!.to[i] - a) * e));
-      if (k === 1) tween = null;
-    }
+    const { robot } = sim;
     budget += dt;
-    while (budget >= sim.timestep) {
-      sim.mujoco.mj_step(sim.model, sim.data);
-      budget -= sim.timestep;
+    while (budget >= robot.model.opt.timestep) {
+      robot.step();
+      budget -= robot.model.opt.timestep;
     }
     sim.sync();
     refreshControls();
@@ -140,7 +128,10 @@ loading
     sim = createSim(mujoco, files);
     scene.add(sim.root);
     $("loading").classList.add("hidden");
-    refreshControls = buildControls(sim);
+    const controls = buildControls(sim.robot);
+    refreshControls = controls.refresh;
+    const agent = setupAgent(sim.robot, controls.lock);
+    controls.onReset(agent.stop);
   })
   .catch((error) => {
     console.error(error);
@@ -150,44 +141,12 @@ loading
 type Sim = ReturnType<typeof createSim>;
 
 function createSim(mujoco: MainModule, files: [string, Uint8Array][]) {
-  mujoco.FS.mkdir("/so101");
-  mujoco.FS.mkdir("/so101/assets");
-  for (const [name, bytes] of files) mujoco.FS.writeFile(`/so101/${name}`, bytes);
-  const model: MjModel = mujoco.MjModel.from_xml_path("/so101/scene_web.xml");
-  for (const [name] of files) mujoco.FS.unlink(`/so101/${name}`); // compiled, no longer needed
-  const data: MjData = new mujoco.MjData(model);
-
-  const actuators = JOINTS.map(([name]) => {
-    const id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR.value, name);
-    if (id < 0) throw new Error(`Actuator ${name} not found`);
-    return { id, qpos: model.jnt_qposadr[model.actuator_trnid[2 * id]] as number };
-  });
-  const range = actuators.map(({ id }) => [model.actuator_ctrlrange[2 * id], model.actuator_ctrlrange[2 * id + 1]]);
-  const { root, items } = buildMeshes(mujoco, model);
-
+  const robot = createRobot(mujoco, loadModel(mujoco, files));
+  const { root, items } = buildMeshes(mujoco, robot.model);
+  const { data } = robot;
   const sim = {
-    mujoco,
-    model,
-    data,
-    timestep: model.opt.timestep,
+    robot,
     root,
-    range,
-    target: [...REST],
-    setCtrl(values: number[]) {
-      const ctrl = data.ctrl;
-      values.forEach((v, i) => {
-        sim.target[i] = THREE.MathUtils.clamp(v, range[i][0], range[i][1]);
-        ctrl[actuators[i].id] = sim.target[i];
-      });
-    },
-    joints: () => actuators.map(({ qpos }) => data.qpos[qpos] as number),
-    reset() {
-      mujoco.mj_resetData(model, data);
-      const qpos = data.qpos;
-      actuators.forEach(({ qpos: adr }, i) => (qpos[adr] = REST[i]));
-      sim.setCtrl(REST);
-      mujoco.mj_forward(model, data);
-    },
     // Copy every drawn geom's world pose from MuJoCo into its three.js object.
     sync() {
       const pos = data.geom_xpos;
@@ -205,7 +164,6 @@ function createSim(mujoco: MainModule, files: [string, Uint8Array][]) {
       }
     },
   };
-  sim.reset();
   sim.sync();
   return sim;
 }
@@ -284,7 +242,7 @@ function meshGeometry(model: MjModel, id: number) {
   return geometry;
 }
 
-function buildControls(sim: Sim) {
+function buildControls(robot: Robot) {
   const poses = $("poses");
   const buttons = POSES.map((pose) => {
     const button = document.createElement("button");
@@ -292,7 +250,7 @@ function buildControls(sim: Sim) {
     button.innerHTML = `<span class="long">${pose.name}</span><span class="short">${pose.short}</span>`;
     button.title = pose.name;
     button.onclick = () => {
-      tween = { from: [...sim.target], to: pose.ctrl, start: performance.now() };
+      robot.play([pose.ctrl], MOVE_SECONDS, 0);
       buttons.forEach((b) => b.classList.toggle("active", b === button));
     };
     poses.append(button);
@@ -306,12 +264,12 @@ function buildControls(sim: Sim) {
     row.className = "joint";
     row.innerHTML = `<label for="j-${name}">${label}</label><input id="j-${name}" type="range" step="any"><output></output>`;
     const input = row.querySelector("input")!;
-    input.min = String(sim.range[i][0]);
-    input.max = String(sim.range[i][1]);
+    input.min = String(robot.range[i][0]);
+    input.max = String(robot.range[i][1]);
     input.oninput = () => {
-      tween = null;
+      robot.cancel();
       buttons.forEach((b) => b.classList.remove("active"));
-      sim.setCtrl(sim.target.map((v, j) => (j === i ? Number(input.value) : v)));
+      robot.setCtrl(robot.target.map((v, j) => (j === i ? Number(input.value) : v)));
     };
     joints.append(row);
     return { input, output: row.querySelector("output")! };
@@ -319,21 +277,32 @@ function buildControls(sim: Sim) {
 
   const reset = $<HTMLButtonElement>("reset");
   reset.disabled = false;
+  let beforeReset = () => {};
   reset.onclick = () => {
-    tween = null;
-    sim.reset();
+    beforeReset();
+    robot.reset();
     buttons.forEach((b, i) => b.classList.toggle("active", i === 0));
   };
 
   // Sliders show the target, the numbers show where each joint actually is.
   const clock = $("clock");
-  return () => {
-    const angles = sim.joints();
-    sliders.forEach(({ input, output }, i) => {
-      input.value = String(sim.target[i]);
-      output.value = `${Math.round(THREE.MathUtils.radToDeg(angles[i]))}°`;
-    });
-    clock.textContent = `${sim.data.time.toFixed(1)} s simulated`;
+  return {
+    refresh() {
+      const angles = robot.joints();
+      sliders.forEach(({ input, output }, i) => {
+        input.value = String(robot.target[i]);
+        output.value = `${Math.round(THREE.MathUtils.radToDeg(angles[i]))}°`;
+      });
+      clock.textContent = `${robot.data.time.toFixed(1)} s simulated`;
+    },
+    // While Jev drives the arm, the manual poses and sliders are off.
+    lock(locked: boolean) {
+      [...buttons, ...sliders.map((s) => s.input)].forEach((el) => (el.disabled = locked));
+      if (locked) buttons.forEach((b) => b.classList.remove("active"));
+    },
+    onReset(callback: () => void) {
+      beforeReset = callback;
+    },
   };
 }
 

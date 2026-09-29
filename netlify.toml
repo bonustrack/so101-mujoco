@@ -4,6 +4,10 @@
   command = "bun install && bun run build"
   publish = "dist"
 
+# jev.ts forwards Jev calls to api.typesafe.ai, which blocks browser calls from this site.
+[functions]
+  directory = "netlify/functions"
+
 [build.environment]
   BUN_VERSION = "1.4.0"
   NODE_VERSION = "22"

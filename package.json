@@ -7,7 +7,8 @@
     "dev": "bun run pack-model && vite",
     "build": "bun run pack-model && vite build",
     "preview": "vite preview",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "check-agent": "bun scripts/check-agent.ts"
   },
   "dependencies": {
     "@mujoco/mujoco": "3.14.0",

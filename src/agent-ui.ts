@@ -122,11 +122,12 @@ export function setupAgent(robot: Robot, lock: (locked: boolean) => void) {
                 `<div class="bar-row" title="${name}: probability ${round(p)}"><span>${name}</span><i style="width:${Math.max(p * 100, 1)}%"></i><b>${round(p)}</b></div>`,
             )
             .join("");
-          const row = add(
-            `<p>Jev chose <strong>${event.answer.choice}</strong><span class="meta">confidence ${round(event.answer.confidence)} · ${Math.round(event.ms)} ms · ${escape(event.model)}</span></p><div class="bars" aria-label="Jev's top probabilities">${bars}</div>`,
-            event.answer.confidence < 0.5 ? "unsure" : "",
+          const unsure = event.answer.confidence < 0.5;
+          add(
+            `<p>Jev chose <strong>${event.answer.choice}</strong><span class="meta">confidence ${round(event.answer.confidence)} · ${Math.round(event.ms)} ms · ${escape(event.model)}</span></p><div class="bars" aria-label="Jev's top probabilities">${bars}</div>` +
+              (unsure ? `<p class="meta">Low confidence: Jev is not sure, the top choice runs anyway.</p>` : ""),
+            unsure ? "unsure" : "",
           );
-          if (event.answer.confidence < 0.5) row.insertAdjacentHTML("beforeend", `<p class="meta">Low confidence: Jev is not sure, the top choice runs anyway.</p>`);
           break;
         }
         case "result":

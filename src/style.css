@@ -571,6 +571,62 @@ section.flow > * {
   color: var(--warn);
 }
 
+#flow .meta-inline {
+  margin-left: 4px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+#flow .step.error {
+  color: var(--warn);
+}
+
+/* The plan: the task as Jev read it, then its steps, ticked as code checks them. */
+#plan {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  background: var(--soft);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+
+#plan p {
+  margin: 0;
+}
+
+#plan .unsure {
+  color: var(--warn);
+}
+
+#plan ol {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+#plan li {
+  color: var(--muted);
+}
+
+#plan li::before {
+  content: "·";
+  display: inline-block;
+  width: 14px;
+}
+
+#plan li.now {
+  color: var(--ink);
+}
+
+#plan li.now::before {
+  content: "›";
+}
+
+#plan li.done::before {
+  content: "✓";
+  color: var(--ink);
+}
+
 /* Jev's probabilities: one series, so the bars carry no legend; values sit at the tip. */
 .bars {
   margin-top: 4px;

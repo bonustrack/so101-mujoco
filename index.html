@@ -55,7 +55,7 @@
             <select id="jev-model" aria-label="Model"><option>jev-latest</option></select>
             <button id="jev-clear" type="button">Clear</button>
           </div>
-          <textarea id="goal" rows="1" spellcheck="false" aria-label="Goal">Take the box</textarea>
+          <textarea id="goal" rows="1" spellcheck="false" aria-label="Goal" placeholder="Take the box, stack all the boxes, put Box 2 on Box 1">Take the box</textarea>
           <div class="buttons">
             <button id="run" type="button" class="primary" disabled>Run</button>
             <button id="stop" type="button" disabled>Stop</button>
@@ -64,7 +64,7 @@
           <p id="status">Paste a key, then press Run.</p>
           <details id="how">
             <summary>How the loop works</summary>
-            <p class="note">Jev takes the target: the selected object, or the first box. Code turns the scene into plain facts, with the target's type and size. Jev is a decision model, not a chat model: it picks the next of 7 commands, with a probability for each. Code solves the joint angles (IK) and MuJoCo moves the arm. Code checks success: target 5 cm up, held for 1 s. At most 12 turns.</p>
+            <p class="note">Jev is a decision model, not a chat model: it picks from fixed lists, with a probability for each option. First it reads the goal: one call maps it to a task (take one object, stack the boxes, stack everything, put one object on another) and fills in which object, onto which, the order and the spot. Code turns the task into a plan of pick-and-place steps, biggest box at the bottom, and makes the plan again after every turn, so a box that falls goes back on the list. Each turn, code turns the scene into plain facts and Jev picks the next command for the current step. Code solves the joint angles (IK), MuJoCo moves the arm, and code checks each step: an object counts as placed once it rests on its target, let go, still for 0.5 s. At most 8 turns per object, plus 4. The arm reaches about 10 cm up with its fingers pointing down, so a tower stops there.</p>
             <p id="price" class="note"></p>
             <p class="note">The key stays in this browser. Calls go through this site's Netlify Function, because TypeSafe blocks browser calls. It passes the key on and never stores or logs it.</p>
             <details>
@@ -86,6 +86,7 @@
             <li data-stage="check">Check</li>
           </ol>
           <p id="cost" class="note">No Jev calls yet.</p>
+          <div id="plan" hidden><p></p><ol></ol></div>
           <ol id="flow"><li class="empty">Each turn shows up here: what Jev saw, what it chose, what it cost, what the arm did.</li></ol>
         </section>
 

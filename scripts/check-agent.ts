@@ -2,7 +2,8 @@
 // Usage: bun run check-agent (no API key needed: Jev is mocked).
 import loadMujoco from "@mujoco/mujoco";
 import { readdirSync, readFileSync } from "node:fs";
-import { COMMANDS, observe, runAgent, type AgentEvent, type Decide, type JevRequest } from "../src/agent";
+import { COMMANDS, maxTurns, observe, question, runAgent, type AgentEvent, type Decide, type JevRequest, type Observation } from "../src/agent";
+import { plan, type Task } from "../src/plan";
 import { createRobot, loadModel, type Obj, type Vec3 } from "../src/robot";
 import jevFunction from "../netlify/functions/jev";
 
@@ -148,30 +149,43 @@ for (const [label, kind, half] of pickCases) {
 }
 
 // 4. The full loop with a mock Jev that replays the plan, in Jev's answer format.
-const answer = (choice: string) => ({
+const choice = (name: string, options: string[], confidence = 0.88) => ({
+  type: "choice" as const,
+  choice: name,
+  probabilities: Object.fromEntries(options.map((c) => [c, c === name ? 0.9 : 0.1 / (options.length - 1)])),
+  confidence,
+});
+const answer = (name: string) => ({
   model: "mock",
-  answers: {
-    next_command: {
-      type: "choice" as const,
-      choice,
-      probabilities: Object.fromEntries(Object.keys(COMMANDS).map((c) => [c, c === choice ? 0.9 : 0.1 / 6])),
-      confidence: 0.88,
-    },
-  },
+  answers: { next_command: choice(name, Object.keys(COMMANDS)) },
   usage: { input_tokens: 700, output_tokens: 20 },
 });
-const validRequest = (r: JevRequest) =>
-  r.model === "jev-latest" &&
-  r.state.goal === "Take the box" &&
-  typeof r.state.observation.gripper_vs_object === "string" &&
-  ["box", "ball"].includes(r.state.observation.object) &&
-  typeof r.state.observation.object_size_cm === "object" &&
-  r.questions.next_command.type === "choice" &&
-  Object.keys(r.questions.next_command.criteria).join() === Object.keys(COMMANDS).join();
+// The goal reading: `task`, and any parameter the test names; the others take their first option.
+let parsed: JevRequest | null = null;
+const reading = (task: string, picks: Record<string, string> = {}, confidence = 0.95) => (r: JevRequest) => {
+  parsed = r;
+  const answers = Object.fromEntries(
+    Object.entries(r.questions).map(([q, { criteria }]) => [q, choice(q === "task" ? task : (picks[q] ?? Object.keys(criteria)[0]), Object.keys(criteria), confidence)]),
+  );
+  return { model: "mock", answers, usage: { input_tokens: 900, output_tokens: 30 } };
+};
+const validRequest = (r: JevRequest) => {
+  const o = r.state.observation as Observation;
+  return (
+    r.model === "jev-latest" &&
+    r.state.goal === "Take the box" &&
+    typeof o.gripper_vs_object === "string" &&
+    ["box", "ball"].includes(o.object) &&
+    typeof o.object_size_cm === "object" &&
+    r.questions.next_command.type === "choice" &&
+    Object.keys(r.questions.next_command.criteria).join() === Object.keys(question("take").next_command.criteria).join()
+  );
+};
 
-async function loop(decide: Decide, signal = new AbortController().signal) {
+async function loop(decide: Decide, signal = new AbortController().signal, goal = "Take the box", task = reading("take"), selected: Obj | null = null) {
   const events: AgentEvent[] = [];
-  await drive(runAgent({ robot, goal: "Take the box", model: "jev-latest", decide, signal, onEvent: (e) => events.push(e) }));
+  const both: Decide = async (request, s) => (request.questions.task ? task(request) : decide(request, s));
+  await drive(runAgent({ robot, goal, model: "jev-latest", decide: both, signal, onEvent: (e) => events.push(e), selected }));
   return events;
 }
 robot.randomize(fresh(), random);
@@ -182,18 +196,20 @@ let events = await loop(async (request) => {
   return answer(PLAN[turn++] ?? "done");
 });
 let end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
-report(end.outcome === "success" && turn === 5, "loop with scripted mock", `${end.outcome} after ${turn} calls: ${end.text}`);
+report(end.outcome === "success" && turn === 5, "loop with scripted mock", `${end.outcome} after ${turn} turns: ${end.text}`);
 report(requestsOk, "every request has goal, observation with the object type and size, and the Choice question");
 
 // 5. Closed loop: a mock that reads the observation like Jev would, and the box jumps mid-run.
-const reactive: Decide = async ({ state: { observation: o } }) =>
-  answer(
+const reactive: Decide = async ({ state }) => {
+  const o = state.observation as Observation;
+  return answer(
     o.gripper_vs_object === "holding the object" ? "lift"
     : o.gripper_vs_object === "the object is between the jaws" ? "close_gripper"
     : o.gripper !== "open" ? "open_gripper"
     : o.gripper_vs_object === "above the object" ? "lower_to_object"
     : "move_above_object",
   );
+};
 fresh();
 let moved = false;
 events = await loop(async (request) => {
@@ -219,10 +235,17 @@ robot.drop();
 settle(0.5);
 robot.focus = robot.pickTarget(ball);
 let seen = "";
-events = await loop(async (request) => {
-  seen ||= `${request.state.observation.object} ${JSON.stringify(request.state.observation.object_size_cm)}`;
-  return reactive(request, new AbortController().signal);
-});
+events = await loop(
+  async (request) => {
+    const o = request.state.observation as Observation;
+    seen ||= `${o.object} ${JSON.stringify(o.object_size_cm)}`;
+    return reactive(request, new AbortController().signal);
+  },
+  undefined,
+  "Take the ball",
+  reading("take"),
+  ball,
+);
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 report(end.outcome === "success" && robot.focus === ball && seen === `ball {"diameter":5}`, "loop takes a dragged, resized ball", `${seen}: ${end.text}`);
 
@@ -237,7 +260,113 @@ events = await loop(async () => {
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 report(end.outcome === "stopped", "Stop ends the run", end.text);
 
-// 8. The proxy: no key is refused locally, a wrong key reaches TypeSafe and comes back refused.
+// 8. Reading the goal: the request carries the objects in words, and code checks Jev's reading.
+fresh();
+robot.add("box");
+events = await loop(async () => answer("done"), undefined, "line them up", reading("other"));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+const sentParse = parsed as JevRequest | null; // set inside the mock, which TypeScript cannot follow
+const labels = (sentParse?.state.objects as string[] | undefined) ?? [];
+report(
+  end.outcome === "error" && /Not something this arm can do yet/.test(end.text) && !events.some((e) => e.type === "turn") &&
+    labels.length === 2 && labels.every((l) => /^Box \d: a box, [\d.]+ x [\d.]+ x [\d.]+ cm, the /.test(l)) &&
+    Object.keys(sentParse!.questions).join() === "task,object,onto,order,spot",
+  "an unsupported goal ends before any turn, and says what works",
+  end.text,
+);
+// Only the reading matters here: the first turn stops the run.
+const stopAtFirstTurn = () => {
+  const c = new AbortController();
+  return [async () => (c.abort(), answer("done")), c.signal] as const;
+};
+events = await loop(...stopAtFirstTurn(), "stack", reading("stack_boxes", {}, 0.4));
+const taskEvent = events.find((e) => e.type === "task") as Extract<AgentEvent, { type: "task" }>;
+report(taskEvent.confidence === 0.4 && taskEvent.maxTurns === 8 * 2 + 4, "a low-confidence reading is passed on with the turn budget", `confidence ${taskEvent.confidence}, ${taskEvent.maxTurns} turns`);
+
+// 9. Pick and place: a mock that reads the observation the way Jev's criteria describe.
+const placer: Decide = async ({ state }) => {
+  const o = state.observation as ReturnType<typeof observe> & { object_vs_target?: string };
+  return answer(
+    o.gripper_vs_object === "holding the object"
+      ? o.object_vs_target === "away from the target" ? "move_above_target" : o.object_vs_target === "above the target" ? "lower_to_place" : "release"
+      : o.gripper_vs_object === "open around the placed object" ? "retreat"
+      : o.gripper_vs_object === "the object is between the jaws" ? "close_gripper"
+      : o.gripper !== "open" ? "open_gripper"
+      : o.gripper_vs_object === "above the object" ? "lower_to_object"
+      : "move_above_object",
+  );
+};
+// A scene of `kinds`, each at a random spot, boxes at random sizes unless `sized` is false.
+const scene = (kinds: ("box" | "ball")[], sized = true) => {
+  robot.resetScene();
+  robot.reset();
+  robot.remove(robot.active()[0]);
+  const objects = kinds.map((k) => robot.add(k)!);
+  if (sized) for (const o of objects) if (o.kind === "box") robot.resize(o, [0.012 + 0.016 * random(), 0.012 + 0.016 * random(), 0.012 + 0.013 * random()]);
+  for (const o of objects) robot.randomize(o, random);
+  robot.reset();
+  settle(0.5);
+  return objects;
+};
+let stacked = 0;
+const worst: string[] = [];
+for (let i = 0; i < 10; i++) {
+  scene(["box", "box", "box"]);
+  events = await loop(placer, undefined, "stack all the boxes", reading("stack_boxes"));
+  end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+  if (end.outcome === "success") stacked++;
+  else worst.push(end.text);
+}
+report(stacked >= 8, "stack 3 boxes of different sizes, 10 random layouts", `${stacked}/10${worst.length ? `; ${worst[0]}` : ""}`);
+// Three boxes as Add box makes them, 3 x 3 x 4 cm: a 12 cm tower.
+let plain = 0;
+const why: string[] = [];
+for (let i = 0; i < 5; i++) {
+  scene(["box", "box", "box"], false);
+  events = await loop(placer, undefined, "stack all the boxes", reading("stack_boxes"));
+  end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+  if (end.outcome === "success") plain++;
+  else why.push(end.text);
+}
+report(plain === 5, "stack 3 default boxes, 5 random layouts", `${plain}/5${why.length ? `; ${why[0]}` : ""}`);
+// A box knocked off the tower goes back on the list and back on the tower.
+const [b1, b2, b3] = scene(["box", "box", "box"], false);
+let knocked = false;
+events = await loop(
+  async (request) => {
+    const task: Task = { kind: "stack", objects: [b1, b2, b3], spot: "here", skipped: [] };
+    if (!knocked && plan(robot, task).steps[1].done) {
+      knocked = true;
+      const spot = robot.clearSpot(b2);
+      robot.place(b2, spot.x, spot.y, 0); // Box 2 is swept off the tower onto the table
+      settle(0.5);
+    }
+    return placer(request, new AbortController().signal);
+  },
+  undefined,
+  "stack all the boxes",
+  reading("stack_boxes"),
+);
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+const replans = events.filter((e) => e.type === "plan").map((e) => (e as Extract<AgentEvent, { type: "plan" }>).plan.steps.filter((s) => s.done).length);
+report(knocked && end.outcome === "success" && replans.some((n, i) => i > 0 && n < replans[i - 1]), "a box knocked off the tower is queued again", `done steps over time ${replans.join(" > ")}: ${end.text}`);
+// Put X on Y, and a ball on top of a stack of everything.
+const [x, y] = scene(["box", "box"]);
+events = await loop(placer, undefined, `put ${x.label} on ${y.label}`, reading("put_on", { object: x.label, onto: y.label }));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+report(end.outcome === "success", "put one box on another", end.text);
+scene(["box", "box", "ball"], false);
+events = await loop(placer, undefined, "stack everything", reading("stack_all"));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+report(end.outcome === "success", "stack 2 boxes and a ball on top", end.text);
+// Too tall: what goes over 10 cm stays out, and the budget follows the objects that go in.
+const tall = scene(["box", "box", "box", "box"], false);
+for (const o of tall) robot.resize(o, [0.015, 0.015, 0.025]);
+events = await loop(...stopAtFirstTurn(), "stack", reading("stack_boxes"));
+const read = events.find((e) => e.type === "task") as Extract<AgentEvent, { type: "task" }>;
+report(/Box 4 stays out/.test(read.text) && read.maxTurns === maxTurns({ kind: "stack", objects: tall.slice(0, 3), spot: "here", skipped: [] }), "a tower over 10 cm leaves the last box out", read.text);
+
+// 10. The proxy: no key is refused locally, a wrong key reaches TypeSafe and comes back refused.
 const local = await jevFunction(new Request("http://x/.netlify/functions/jev", { method: "POST", body: "{}" }));
 report(local.status === 401, "proxy without a key", `HTTP ${local.status}`);
 const upstream = await jevFunction(new Request("http://x/.netlify/functions/jev", { headers: { authorization: "Bearer not-a-key" } }));

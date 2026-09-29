@@ -1,5 +1,6 @@
 // The Jev and Flow sections: key and model, the goal, Run and Stop, a live log of every turn, and what the calls cost.
-import { MAX_TURNS, QUESTIONS, runAgent, type AgentEvent, type JevResponse } from "./agent";
+import { question, runAgent, type AgentEvent, type ChoiceAnswer, type JevResponse } from "./agent";
+import { SUPPORTED, TASKS, type Plan } from "./plan";
 import { PRICE_NOTE, askJev, jevCost, listModels } from "./jev";
 import type { Obj, Robot } from "./robot";
 
@@ -17,7 +18,7 @@ const price = (t: Tally) =>
   t.unpriced === 0 ? usd.format(t.usd) : t.unpriced === t.calls ? "cost unknown" : `${usd.format(t.usd)} + ${t.unpriced} unpriced`;
 const spent = (t: Tally) => `${t.calls} ${t.calls === 1 ? "call" : "calls"} · ${count(t.input)} in / ${count(t.output)} out · ${price(t)}`;
 
-// Jev's target is the selected object, else the first box, else the first object.
+// Taking one object, Jev's target is the selected object, else the one the goal names, else the first box.
 export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (locked: boolean) => void) {
   const key = $<HTMLInputElement>("jev-key");
   const model = $<HTMLSelectElement>("jev-model");
@@ -28,7 +29,8 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   const status = $("status");
   const flow = $("flow");
   const stages = [...$("diagram").querySelectorAll<HTMLElement>("li")];
-  $("question").textContent = JSON.stringify(QUESTIONS, null, 2);
+  $("question").textContent = JSON.stringify({ read_the_goal: { task: TASKS }, take_one_object: question("take"), put_one_on_another: question("place") }, null, 2);
+  const planBox = $("plan");
   const cost = $("cost");
   const costShort = $("cost-short"); // the session total, in view when Flow is folded
   $("price").textContent = `Cost uses TypeSafe's published price. ${PRICE_NOTE}. Other models show their tokens and "cost unknown".`;
@@ -58,21 +60,17 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   const target = () => robot.pickTarget(selected());
   const idle = () => {
     const next = target();
-    run.disabled = controller !== null || !key.value.trim() || !next || !!robot.tooBig(next);
+    run.disabled = controller !== null || !key.value.trim() || !next;
     stopButton.disabled = controller === null;
     randomize.disabled = !next;
   };
   const hint = () => {
     if (controller) return;
-    const next = target();
-    const why = next && robot.tooBig(next);
-    status.textContent = !next
+    status.textContent = !target()
       ? "Add a box or a ball, then press Run."
-      : why
-        ? `${next.label} is too big to grab: ${why}. Resize it or select another object.`
-        : key.value.trim()
-          ? `Ready. Press Run: Jev takes ${next.label}.`
-          : `Paste a key, then press Run. Jev takes ${next.label}.`;
+      : key.value.trim()
+        ? `Ready. Press Run. ${SUPPORTED}`
+        : `Paste a key, then press Run. ${SUPPORTED}`;
   };
   const highlight = (stage: string | null) => stages.forEach((li) => li.classList.toggle("on", li.dataset.stage === stage));
 
@@ -127,13 +125,18 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
     const apiKey = key.value.trim();
     const next = target();
     if (!apiKey || controller || !next) return;
-    // The target stays the same for the whole run, whatever gets selected meanwhile.
+    // The selection is read once, at the start: selecting another object mid-run changes nothing.
+    const chosen = selected();
     robot.focus = next;
-    if (/^Take the (box|ball)$/.test(goal.value.trim())) goal.value = `Take the ${next.kind}`;
+    if (chosen && /^Take the (box|ball)$/.test(goal.value.trim())) goal.value = `Take the ${chosen.kind}`;
     controller = new AbortController();
     lock(true);
     idle();
     flow.replaceChildren();
+    planBox.hidden = true;
+    let turns = 0;
+    let turn = 0;
+    let task = "";
     follow = true;
     runCost = tally();
     showCost();
@@ -148,37 +151,77 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
       if (follow) flow.scrollTop = flow.scrollHeight;
       return row;
     };
+    // Jev's answer: its choice, confidence, time, tokens and cost, and its top 3 probabilities.
+    const decision = (label: string, answer: ChoiceAnswer, model: string, ms: number, usage: JevResponse["usage"], note = "") => {
+      const top = Object.entries(answer.probabilities)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3);
+      const bars = top
+        .map(
+          ([name, p]) =>
+            `<div class="bar-row" title="${escape(name)}: probability ${round(p)}"><span>${escape(name)}</span><i style="width:${Math.max(p * 100, 1)}%"></i><b>${round(p)}</b></div>`,
+        )
+        .join("");
+      const dollars = charge(model, usage);
+      const tokens = usage ? `${count(usage.input_tokens)} in + ${count(usage.output_tokens)} out tokens` : "no token count";
+      return (
+        `<p>${label} <strong>${escape(answer.choice)}</strong><span class="meta">confidence ${round(answer.confidence)} · ${Math.round(ms)} ms · ${escape(model)}</span><span class="meta">${tokens} · ${dollars === null ? "cost unknown" : usd.format(dollars)}</span></p><div class="bars" aria-label="Jev's top probabilities">${bars}</div>` +
+        note
+      );
+    };
+    const sent = (what: string, state: unknown) => {
+      const row = add(`<details><summary>Sent to Jev: ${what}</summary><pre></pre></details>`);
+      row.querySelector("pre")!.textContent = JSON.stringify(state, null, 2);
+    };
+    // The plan: the task as read, then each step, ticked once code has checked it.
+    const showPlan = (plan: Plan) => {
+      const now = plan.steps.findIndex((s) => !s.done);
+      const steps = plan.steps.map((s, i) => `<li class="${s.done ? "done" : i === now ? "now" : ""}">${escape(s.text)}</li>`).join("");
+      planBox.querySelector("ol")!.innerHTML = steps;
+      planBox.hidden = false;
+    };
     const onEvent = (event: AgentEvent) => {
       switch (event.type) {
         case "stage":
           highlight(event.stage);
-          status.textContent = `Turn ${flow.children.length} of ${MAX_TURNS}: ${STAGE_TEXT[event.stage]}`;
+          status.textContent = turn ? `Turn ${turn} of ${turns}: ${STAGE_TEXT[event.stage]}` : `Reading the goal: ${STAGE_TEXT[event.stage]}`;
+          break;
+        case "task": {
+          task = event.name;
+          turns = event.maxTurns;
+          current = document.createElement("li");
+          current.innerHTML = `<h3>Goal</h3>`;
+          flow.append(current);
+          sent("goal, objects, selection", event.request.state);
+          const unsure = event.confidence < 0.6;
+          add(
+            decision("Jev read it as", event.answers.task, event.model, event.ms, event.usage, unsure ? `<p class="meta">Low confidence ${round(event.confidence)}: Jev is not sure about this reading. Check it in the plan above.</p>` : ""),
+            unsure ? "unsure" : "",
+          );
+          add(`<p><span class="tag">Task</span>${escape(event.text)}</p>`, event.ok ? "" : "error");
+          const head = planBox.querySelector("p")!;
+          head.innerHTML = `<strong>${escape(event.text)}</strong>` + (unsure ? ` <span class="unsure">Jev is not sure (confidence ${round(event.confidence)}).</span>` : "");
+          planBox.querySelector("ol")!.replaceChildren();
+          planBox.hidden = false;
+          break;
+        }
+        case "plan":
+          turns = event.maxTurns;
+          showPlan(event.plan);
           break;
         case "turn": {
+          turn = event.turn;
           current = document.createElement("li");
-          current.innerHTML = `<h3>Turn ${event.turn}</h3>`;
+          current.innerHTML = `<h3>Turn ${event.turn} <span class="meta-inline">${escape(event.subgoal)}</span></h3>`;
           flow.append(current);
-          const sent = add(`<details><summary>Sent to Jev: goal, observation, history</summary><pre></pre></details>`);
-          sent.querySelector("pre")!.textContent = JSON.stringify(event.request.state, null, 2);
+          sent("goal, observation, history", event.request.state);
           break;
         }
         case "decision": {
           highlight("command");
-          const top = Object.entries(event.answer.probabilities)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 3);
-          const bars = top
-            .map(
-              ([name, p]) =>
-                `<div class="bar-row" title="${name}: probability ${round(p)}"><span>${name}</span><i style="width:${Math.max(p * 100, 1)}%"></i><b>${round(p)}</b></div>`,
-            )
-            .join("");
           const unsure = event.answer.confidence < 0.5;
-          const dollars = charge(event.model, event.usage);
-          const tokens = event.usage ? `${count(event.usage.input_tokens)} in + ${count(event.usage.output_tokens)} out tokens` : "no token count";
           add(
-            `<p>Jev chose <strong>${event.answer.choice}</strong><span class="meta">confidence ${round(event.answer.confidence)} · ${Math.round(event.ms)} ms · ${escape(event.model)}</span><span class="meta">${tokens} · ${dollars === null ? "cost unknown" : usd.format(dollars)}</span></p><div class="bars" aria-label="Jev's top probabilities">${bars}</div>` +
-              (unsure ? `<p class="meta">Low confidence: Jev is not sure, the top choice runs anyway.</p>` : ""),
+            decision("Jev chose", event.answer, event.model, event.ms, event.usage, unsure ? `<p class="meta">Low confidence: Jev is not sure, the top choice runs anyway.</p>` : ""),
             unsure ? "unsure" : "",
           );
           break;
@@ -189,11 +232,13 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
         case "check":
           add(`<p><span class="tag">Check</span>${escape(event.text)}</p>`, event.success ? "ok" : "");
           break;
-        case "end":
+        case "end": {
           current = flow;
-          add(`<p><strong>${END_TEXT[event.outcome]}</strong> ${escape(event.text)}</p>`, `end ${event.outcome}`);
-          status.textContent = `${END_TEXT[event.outcome]} ${event.text}`;
+          const word = event.outcome === "success" ? (DONE_TEXT[task] ?? "Done.") : END_TEXT[event.outcome];
+          add(`<p><strong>${word}</strong> ${escape(event.text)}</p>`, `end ${event.outcome}`);
+          status.textContent = `${word} ${event.text}`;
           break;
+        }
       }
     };
     await runAgent({
@@ -203,6 +248,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
       decide: (request, signal) => askJev(apiKey, request, signal),
       signal: controller.signal,
       onEvent,
+      selected: chosen,
     });
     lock(false); // before clearing the controller, so the end message stays up
     controller = null;
@@ -225,10 +271,11 @@ const STAGE_TEXT: Record<string, string> = {
   jev: "waiting for Jev",
   ik: "solving the joint angles",
   physics: "moving the arm",
-  check: "checking the target",
+  check: "checking the result",
 };
+const DONE_TEXT: Record<string, string> = { take: "Lifted.", stack_boxes: "Stacked.", stack_all: "Stacked.", put_on: "Placed." };
 const END_TEXT: Record<Extract<AgentEvent, { type: "end" }>["outcome"], string> = {
-  success: "Lifted.",
+  success: "Done.",
   done: "Jev stopped.",
   stopped: "Stopped.",
   turns: "Out of turns.",

@@ -108,9 +108,11 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   const armGeoms = Array.from({ length: model.ngeom }, (_, g) => g).filter(
     (g) => model.geom_bodyid[g] > 0 && !objects.some((o) => o.geom === g) && (model.geom_contype[g] || model.geom_conaffinity[g]),
   );
+  const byGeom = new Map(objects.map((o) => [o.geom, o]));
+  const floor = id(obj.mjOBJ_GEOM, "floor");
   let added = 0;
   let dragged: { o: Obj; pose: number[] } | null = null;
-  let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void } | null = null;
+  let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void; until?: () => boolean } | null = null;
 
   // Write a free joint's pose (x y z and quaternion) and stop it.
   const pin = (o: Obj, pose: number[]) => {
@@ -178,6 +180,8 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
         const a = motion.path[i];
         const b = motion.path[i + 1];
         robot.setCtrl(a.map((v, j) => v + (b[j] - v) * (s - i)));
+        // Stop where the arm is the moment `until` holds, then settle there.
+        if (motion.until?.()) Object.assign(motion, { until: undefined, path: [[...robot.target], [...robot.target]], start: data.time - motion.duration });
         if (t >= motion.duration + motion.settle) {
           const { done } = motion;
           motion = null;
@@ -187,11 +191,11 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       mujoco.mj_step(model, data);
     },
     // Glide the actuator targets through `path` (full 6-joint targets), then hold for `settle` seconds.
-    // Resolves in simulated time, so it works the same live and headless.
-    play(path: number[][], duration: number, settle = 0.25) {
+    // Resolves in simulated time, so it works the same live and headless. `until`, checked every step, ends the glide early.
+    play(path: number[][], duration: number, settle = 0.25, until?: () => boolean) {
       robot.cancel();
       return new Promise<void>((done) => {
-        motion = { path: [[...robot.target], ...path], start: data.time, duration: Math.max(duration, 1e-3), settle, done };
+        motion = { path: [[...robot.target], ...path], start: data.time, duration: Math.max(duration, 1e-3), settle, done, until };
       });
     },
     hold: (seconds: number) => robot.play([[...robot.target]], 1e-3, seconds),
@@ -273,12 +277,12 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       data.qvel.fill(0, o.dof, o.dof + 6);
     },
     // How much room `o` would have at (x, y): the gap to the nearest other object or arm part it could touch.
-    // Negative when it would overlap one. The arm counts where it stands now.
-    roomFinder(o: Obj) {
+    // Negative when it would overlap one. The arm counts where it stands now, unless `arm` is false.
+    roomFinder(o: Obj, arm = true) {
       const height = 2 * o.size[2] + 0.03;
       const obstacles = [
         ...robot.active().flatMap((other) => (other === o ? [] : [[...robot.object(other).pos, robot.footprint(other)]])),
-        ...armGeoms.flatMap((g) => {
+        ...(arm ? armGeoms : []).flatMap((g) => {
           const p = data.geom_xpos.subarray(3 * g, 3 * g + 3);
           const r = model.geom_rbound[g];
           return p[2] - r < height ? [[p[0], p[1], p[2], r]] : [];
@@ -348,13 +352,19 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     // Direction the jaws close along, as a heading in radians.
     handYaw: () => Math.atan2(data.xmat[9 * hand + 3], data.xmat[9 * hand]),
     // Which jaws touch the target right now, and whether any part of the arm does.
-    contacts() {
+    contacts: () => robot.touching(robot.focus),
+    // Everything that touches `o` right now: each jaw, any arm part, other objects, the table.
+    touching(o: Obj | null) {
       let fixed = false;
       let moving = false;
       let arm = false;
-      const geom = robot.focus?.geom ?? -1;
+      let table = false;
+      const others = new Set<Obj>();
+      const geom = o?.geom ?? -1;
+      // data.contact is a fresh copy of every contact on each read: read it once and free it.
+      const contacts = data.contact;
       for (let i = 0; i < data.ncon; i++) {
-        const c = data.contact.get(i);
+        const c = contacts.get(i);
         if (!c) continue;
         const other = c.geom1 === geom ? c.geom2 : c.geom2 === geom ? c.geom1 : -1;
         if (other >= 0) {
@@ -362,11 +372,17 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
           if (body === hand) fixed = true;
           if (body === jaw) moving = true;
           if (armGeoms.includes(other)) arm = true;
+          if (other === floor) table = true;
+          const touched = byGeom.get(other);
+          if (touched) others.add(touched);
         }
         c.delete();
       }
-      return { fixed, moving, arm };
+      contacts.delete();
+      return { fixed, moving, arm, table, others };
     },
+    // Linear speed in m/s.
+    speed: (o: Obj) => Math.hypot(...data.qvel.subarray(o.dof, o.dof + 3)),
     // Target centre in the hand frame: x across the jaws, z along the fingers (tips near z = -0.1).
     objectInHand() {
       const p = robot.object().pos;
@@ -441,19 +457,43 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       const shift = Math.max(0, robot.across(yaw) / 2 - 0.015);
       return [x - shift * Math.cos(yaw), y - shift * Math.sin(yaw), z];
     },
-    // The jaw direction that matches a face of the target, fits between the open jaws and needs the
-    // least wrist roll from here, with the tip position for it at height `z`.
+    // The jaw direction that matches a face of the target, fits between the open jaws, keeps the open jaws
+    // off every other object once lowered, and needs the least wrist roll from here, with the tip position
+    // for it at height `z`.
     graspYaw(z: number) {
-      const faceYaw = robot.object().yaw;
+      const o = robot.object();
+      const faceYaw = o.yaw;
       let best = { q: [] as number[], miss: Infinity, yaw: 0, pos: [0, 0, 0] as Vec3, cost: Infinity };
       for (let k = 0; k < 4; k++) {
         const yaw = faceYaw + (k * Math.PI) / 2;
         const pos = robot.gripPoint(yaw, z);
         const s = robot.solve(pos, yaw, [Math.atan2(pos[1], pos[0]), 0, 0, 1.2, 0]);
-        const cost = s.error + 0.01 * Math.abs(s.q[4]) + (robot.across(yaw) > JAWS + 1e-9 ? 1 : 0);
+        const low = robot.solve(robot.gripPoint(yaw, Math.max(o.bottom + 0.01, o.pos[2] - 0.005)), yaw, s.q);
+        const bump = robot.active().length > 1 && robot.collides(low.q, OPEN, robot.focus) ? 0.5 : 0;
+        const cost = s.error + 0.01 * Math.abs(s.q[4]) + (robot.across(yaw) > JAWS + 1e-9 ? 1 : 0) + bump;
         if (cost < best.cost) best = { ...s, yaw, pos, cost };
       }
       return best;
+    },
+    // Whether the arm posed at `q`, gripper at `grip`, would touch any object but `except`. Checked on the
+    // IK scratch data, so the live physics is untouched.
+    collides(q: number[], grip: number, except: Obj | null) {
+      scratch.qpos.set(data.qpos);
+      actuators.slice(0, ARM).forEach(({ qpos }, i) => (scratch.qpos[qpos] = q[i]));
+      scratch.qpos[actuators[GRIPPER].qpos] = grip;
+      mujoco.mj_fwdPosition(model, scratch);
+      const contacts = scratch.contact;
+      let hit = false;
+      for (let i = 0; i < scratch.ncon; i++) {
+        const c = contacts.get(i);
+        if (!c) continue;
+        const a = byGeom.get(c.geom1) ?? byGeom.get(c.geom2);
+        const arm = armGeoms.includes(c.geom1) || armGeoms.includes(c.geom2);
+        if (a && a !== except && a.active && arm) hit = true;
+        c.delete();
+      }
+      contacts.delete();
+      return hit;
     },
   };
   robot.resetScene();

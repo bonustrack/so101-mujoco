@@ -49,6 +49,14 @@ for (let i = 0; i < N; i++) {
   if (await scriptedPick()) picked++;
 }
 report(picked === N, "scripted pick, random boxes", `${picked}/${N}`);
+// The folded arm's jaws rest inside the random area: a box must never start in them.
+let touching = 0;
+for (let i = 0; i < 500; i++) {
+  robot.reset();
+  robot.randomBox(random);
+  if (robot.contacts().arm) touching++;
+}
+report(touching === 0, "random boxes start clear of the arm", `${touching}/500 touching`);
 
 // 2. The full loop with a mock Jev that replays the plan, in Jev's answer format.
 const answer = (choice: string) => ({

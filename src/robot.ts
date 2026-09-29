@@ -133,11 +133,15 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       for (let i = 0; i < 6; i++) data.qvel[boxDof + i] = 0;
       mujoco.mj_forward(model, data);
     },
-    // A random spot in front of the arm that a top-down grasp can reach.
+    // A random spot in front of the arm that a top-down grasp can reach, clear of the arm:
+    // the folded arm's jaws rest inside this area, and a box dropped into them reads as held.
     randomBox(random = Math.random) {
-      const r = 0.16 + 0.08 * random();
-      const a = (random() - 0.5) * 1.6;
-      robot.placeBox(r * Math.cos(a), r * Math.sin(a), (random() - 0.5) * Math.PI);
+      for (let tries = 0; tries < 20; tries++) {
+        const r = 0.16 + 0.08 * random();
+        const a = (random() - 0.5) * 1.6;
+        robot.placeBox(r * Math.cos(a), r * Math.sin(a), (random() - 0.5) * Math.PI);
+        if (!robot.contacts().arm) return;
+      }
     },
 
     // Scene facts, all computed from the physics state.
@@ -157,10 +161,11 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     tcp: () => Array.from(data.site_xpos.subarray(3 * tcp, 3 * tcp + 3)) as Vec3,
     // Direction the jaws close along, as a heading in radians.
     handYaw: () => Math.atan2(data.xmat[9 * hand + 3], data.xmat[9 * hand]),
-    // Which jaws touch the box right now.
+    // Which jaws touch the box right now, and whether any part of the arm does.
     contacts() {
       let fixed = false;
       let moving = false;
+      let arm = false;
       for (let i = 0; i < data.ncon; i++) {
         const c = data.contact.get(i);
         if (!c) continue;
@@ -169,10 +174,11 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
           const body = model.geom_bodyid[other];
           if (body === hand) fixed = true;
           if (body === jaw) moving = true;
+          if (body !== 0) arm = true; // body 0 is the world: the floor
         }
         c.delete();
       }
-      return { fixed, moving };
+      return { fixed, moving, arm };
     },
     // Box centre in the hand frame: x across the jaws, z along the fingers (tips near z = -0.1).
     boxInHand() {

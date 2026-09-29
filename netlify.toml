@@ -1,0 +1,21 @@
+# Static site: Vite builds into dist. Deploy with "Import from GitHub" or
+# https://app.netlify.com/start/deploy?repository=https://github.com/bonustrack/so101-mujoco
+[build]
+  command = "bun install && bun run build"
+  publish = "dist"
+
+[build.environment]
+  BUN_VERSION = "1.4.0"
+  NODE_VERSION = "22"
+
+# MuJoCo's single-threaded WASM build needs no SharedArrayBuffer, so no COOP/COEP headers.
+[[headers]]
+  for = "/assets/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+
+# Vite fingerprints everything in /assets, so it can be cached for good.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

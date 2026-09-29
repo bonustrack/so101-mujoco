@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>SO-101 arm in MuJoCo</title>
+    <meta name="description" content="The SO-101 robot arm, simulated live with MuJoCo physics in your browser." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ffd11f'/%3E%3C/svg%3E" />
+    <link rel="preload" href="/so101.pack.gz" as="fetch" crossorigin />
+  </head>
+  <body>
+    <main id="view">
+      <div id="loading">
+        <p id="loading-text">Loading MuJoCo and the SO-101 model</p>
+        <div class="bar"><div id="loading-bar"></div></div>
+      </div>
+      <p class="hint"><span class="mouse">Drag to orbit, scroll to zoom</span><span class="touch">Drag to orbit, pinch to zoom</span></p>
+    </main>
+
+    <aside id="panel">
+      <header>
+        <h1>SO-101</h1>
+        <p>A low-cost robot arm, simulated live with MuJoCo physics.</p>
+      </header>
+
+      <section>
+        <h2>Poses</h2>
+        <div id="poses"></div>
+      </section>
+
+      <section>
+        <h2>Joints</h2>
+        <div id="joints"></div>
+      </section>
+
+      <div class="row">
+        <button id="reset" type="button" disabled>Reset</button>
+        <span id="clock">Not started</span>
+      </div>
+
+      <footer>
+        Model: <a href="https://github.com/TheRobotStudio/SO-ARM100">SO-101 by The Robot Studio</a>, via
+        <a href="https://github.com/google-deepmind/mujoco_menagerie/tree/main/robotstudio_so101">MuJoCo Menagerie</a>,
+        <a href="/so101/LICENSE.txt">Apache-2.0</a>. Physics: <a href="https://github.com/google-deepmind/mujoco">MuJoCo</a> 3.14.
+      </footer>
+    </aside>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

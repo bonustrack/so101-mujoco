@@ -1,0 +1,21 @@
+{
+  "name": "so101-mujoco",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pack-model": "bun scripts/pack-model.ts",
+    "dev": "bun run pack-model && vite",
+    "build": "bun run pack-model && vite build",
+    "preview": "vite preview",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mujoco/mujoco": "3.14.0",
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "0.186.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.1"
+  }
+}

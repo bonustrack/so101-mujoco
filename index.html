@@ -17,101 +17,84 @@
       <p class="hint"><span class="mouse">Drag to orbit, scroll to zoom</span><span class="touch">Drag to orbit, pinch to zoom</span></p>
     </main>
 
-    <aside id="agent">
-      <header>
-        <h1>Jev takes the box</h1>
-        <p>Jev picks each command from what the arm sees, until the target is lifted: the selected object, or the first box.</p>
-      </header>
-
-      <section>
-        <h2>Jev</h2>
-        <div class="field">
-          <input id="jev-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your TypeSafe API key" aria-label="Jev API key" />
-          <button id="jev-clear" type="button">Clear</button>
-        </div>
-        <select id="jev-model" aria-label="Model"><option>jev-latest</option></select>
-        <p class="note">The key stays in this browser. Calls go through this site's Netlify Function, because TypeSafe blocks browser calls. It passes the key on and never stores or logs it.</p>
-      </section>
-
-      <section>
-        <h2>Goal</h2>
-        <textarea id="goal" rows="2" spellcheck="false" aria-label="Goal">Take the box</textarea>
-        <div class="buttons">
-          <button id="run" type="button" class="primary" disabled>Run</button>
-          <button id="stop" type="button" disabled>Stop</button>
-          <button id="randomize" type="button" title="Move the target to a random spot in reach" disabled>Randomize</button>
-        </div>
-        <p id="status">Paste a key, then press Run.</p>
-      </section>
-
-      <section>
-        <h2>How it works</h2>
-        <ol id="diagram" aria-label="The loop">
-          <li data-stage="goal">Goal</li>
-          <li data-stage="observe">Observe</li>
-          <li data-stage="jev">Jev</li>
-          <li data-stage="command">Command</li>
-          <li data-stage="ik">IK</li>
-          <li data-stage="physics">Physics</li>
-          <li data-stage="check">Check</li>
-        </ol>
-        <details id="how" open>
-          <summary>How the loop works</summary>
-          <p class="note">Code turns the scene into plain facts, with the target's type and size. Jev is a decision model, not a chat model: it picks the next of 7 commands, with a probability for each. Code solves the joint angles (IK) and MuJoCo moves the arm. Code checks success: target 5 cm up, held for 1 s. At most 12 turns.</p>
-          <details>
-            <summary>The question Jev answers</summary>
-            <pre id="question"></pre>
-          </details>
-        </details>
-      </section>
-
-      <section class="flow">
-        <h2>Flow</h2>
-        <ol id="flow"><li class="empty">Each turn shows up here: what Jev saw, what it chose, what the arm did.</li></ol>
-      </section>
-    </aside>
-
+    <!-- One slim panel: a side panel on wide screens, a bottom sheet on phones. -->
     <aside id="panel">
       <header>
-        <h1>SO-101</h1>
-        <p>A low-cost robot arm, simulated live with MuJoCo physics.</p>
+        <h1>SO-101 <span>with Jev</span></h1>
+        <span id="clock" title="Simulated time">Not started</span>
+        <button id="reset" type="button" title="Arm back to rest, objects back where you placed them" disabled>Reset</button>
+        <button id="fold" type="button" class="icon" aria-expanded="true" aria-controls="sections" title="Hide the panel"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5" /></svg></button>
       </header>
 
-      <section>
-        <h2>Poses</h2>
-        <div id="poses"></div>
-      </section>
+      <div id="sections">
+        <section class="closed">
+          <h2><button type="button" aria-expanded="false">Robot</button></h2>
+          <div id="poses"></div>
+          <div id="joints"></div>
+        </section>
 
-      <section>
-        <h2>Joints</h2>
-        <div id="joints"></div>
-      </section>
+        <section>
+          <h2><button type="button" aria-expanded="true">Scene</button></h2>
+          <div class="scene-buttons">
+            <button id="add-box" type="button" disabled>Add box</button>
+            <button id="add-ball" type="button" disabled>Add ball</button>
+            <button id="reset-scene" type="button" disabled>Reset scene</button>
+          </div>
+          <p id="scene-hint" class="note"><span class="mouse">Click an object to select it, drag it to move it. Arrow keys nudge it.</span><span class="touch">Tap an object to select it, drag it to move it.</span></p>
+          <div id="selection" hidden>
+            <div class="selected"><strong id="selected-name"></strong><button id="delete" type="button">Delete</button></div>
+            <div id="sizes"></div>
+            <p id="grab" class="note"></p>
+          </div>
+        </section>
 
-      <section>
-        <h2>Scene</h2>
-        <div class="scene-buttons">
-          <button id="add-box" type="button" disabled>Add box</button>
-          <button id="add-ball" type="button" disabled>Add ball</button>
-          <button id="reset-scene" type="button" disabled>Reset scene</button>
-        </div>
-        <p id="scene-hint" class="note"><span class="mouse">Click an object to select it, drag it to move it. Arrow keys nudge it.</span><span class="touch">Tap an object to select it, drag it to move it.</span></p>
-        <div id="selection" hidden>
-          <div class="selected"><strong id="selected-name"></strong><button id="delete" type="button">Delete</button></div>
-          <div id="sizes"></div>
-          <p id="grab" class="note"></p>
-        </div>
-      </section>
+        <section>
+          <h2><button type="button" aria-expanded="true">Jev</button></h2>
+          <div class="field">
+            <input id="jev-key" type="password" autocomplete="off" spellcheck="false" placeholder="TypeSafe API key" aria-label="Jev API key" />
+            <select id="jev-model" aria-label="Model"><option>jev-latest</option></select>
+            <button id="jev-clear" type="button">Clear</button>
+          </div>
+          <textarea id="goal" rows="1" spellcheck="false" aria-label="Goal">Take the box</textarea>
+          <div class="buttons">
+            <button id="run" type="button" class="primary" disabled>Run</button>
+            <button id="stop" type="button" disabled>Stop</button>
+            <button id="randomize" type="button" title="Move the target to a random spot in reach" disabled>Randomize</button>
+          </div>
+          <p id="status">Paste a key, then press Run.</p>
+          <details id="how">
+            <summary>How the loop works</summary>
+            <p class="note">Jev takes the target: the selected object, or the first box. Code turns the scene into plain facts, with the target's type and size. Jev is a decision model, not a chat model: it picks the next of 7 commands, with a probability for each. Code solves the joint angles (IK) and MuJoCo moves the arm. Code checks success: target 5 cm up, held for 1 s. At most 12 turns.</p>
+            <p id="price" class="note"></p>
+            <p class="note">The key stays in this browser. Calls go through this site's Netlify Function, because TypeSafe blocks browser calls. It passes the key on and never stores or logs it.</p>
+            <details>
+              <summary>The question Jev answers</summary>
+              <pre id="question"></pre>
+            </details>
+          </details>
+        </section>
 
-      <div class="row">
-        <button id="reset" type="button" title="Arm back to rest, objects back where you placed them" disabled>Reset</button>
-        <span id="clock">Not started</span>
+        <section class="flow">
+          <h2><button type="button" aria-expanded="true">Flow</button><span id="cost-short" title="Jev cost this session"></span></h2>
+          <ol id="diagram" aria-label="The loop">
+            <li data-stage="goal">Goal</li>
+            <li data-stage="observe">Observe</li>
+            <li data-stage="jev">Jev</li>
+            <li data-stage="command">Command</li>
+            <li data-stage="ik">IK</li>
+            <li data-stage="physics">Physics</li>
+            <li data-stage="check">Check</li>
+          </ol>
+          <p id="cost" class="note">No Jev calls yet.</p>
+          <ol id="flow"><li class="empty">Each turn shows up here: what Jev saw, what it chose, what it cost, what the arm did.</li></ol>
+        </section>
+
+        <footer>
+          Model: <a href="https://github.com/TheRobotStudio/SO-ARM100">SO-101 by The Robot Studio</a>, via
+          <a href="https://github.com/google-deepmind/mujoco_menagerie/tree/main/robotstudio_so101">MuJoCo Menagerie</a>,
+          <a href="/so101/LICENSE.txt">Apache-2.0</a>. Physics: <a href="https://github.com/google-deepmind/mujoco">MuJoCo</a> 3.14.
+        </footer>
       </div>
-
-      <footer>
-        Model: <a href="https://github.com/TheRobotStudio/SO-ARM100">SO-101 by The Robot Studio</a>, via
-        <a href="https://github.com/google-deepmind/mujoco_menagerie/tree/main/robotstudio_so101">MuJoCo Menagerie</a>,
-        <a href="/so101/LICENSE.txt">Apache-2.0</a>. Physics: <a href="https://github.com/google-deepmind/mujoco">MuJoCo</a> 3.14.
-      </footer>
     </aside>
 
     <script type="module" src="/src/main.ts"></script>

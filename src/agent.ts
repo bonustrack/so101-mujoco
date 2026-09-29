@@ -15,7 +15,7 @@ export type Stage = "observe" | "jev" | "ik" | "physics" | "check";
 export type AgentEvent =
   | { type: "stage"; stage: Stage }
   | { type: "turn"; turn: number; request: JevRequest }
-  | { type: "decision"; turn: number; answer: ChoiceAnswer; model: string; ms: number; tokens: number }
+  | { type: "decision"; turn: number; answer: ChoiceAnswer; model: string; ms: number; tokens: number; usage: JevResponse["usage"] }
   | { type: "result"; turn: number; command: string; text: string }
   | { type: "check"; turn: number; success: boolean; text: string }
   | { type: "end"; outcome: "success" | "done" | "stopped" | "turns" | "error"; text: string };
@@ -189,7 +189,7 @@ export async function runAgent(options: {
       const answer = response.answers?.next_command;
       if (answer?.type !== "choice" || !(answer.choice in COMMANDS)) throw new Error(`Unexpected answer from Jev: ${JSON.stringify(response).slice(0, 200)}`);
       tokens += response.usage?.input_tokens ?? 0;
-      emit({ type: "decision", turn, answer, model: response.model, ms: performance.now() - started, tokens });
+      emit({ type: "decision", turn, answer, model: response.model, ms: performance.now() - started, tokens, usage: response.usage });
 
       const command = COMMANDS[answer.choice];
       if (!command.run) {

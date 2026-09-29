@@ -78,27 +78,43 @@ controls.maxDistance = 3;
 controls.maxPolarAngle = Math.PI / 2 - 0.03;
 
 // Start from a 3/4 front-left view far enough back to fit every pose and the box.
-// On wide screens the panels float left and right, so the view centres on the gap between them.
+// The panel covers the right side on wide screens and the bottom on phones, so the view centres on the rest.
 let framed = false;
+const panel = $("panel");
 function resize() {
   const { clientWidth: w, clientHeight: h } = view;
-  const [left, right] = ["agent", "panel"].map((id) => {
-    const panel = $(id);
-    return getComputedStyle(panel).position === "fixed" ? panel.offsetWidth + 20 : 0;
-  });
-  const shift = (right - left) / 2;
+  const box = panel.getBoundingClientRect();
+  const sheet = box.left < 1; // phones: a bottom sheet across the full width
+  const right = sheet || panel.classList.contains("folded") ? 0 : w - box.left;
+  const bottom = sheet ? h - box.top : 0;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
-  camera.setViewOffset(w, h, shift, 0, w, h);
+  camera.setViewOffset(w, h, right / 2, bottom / 2, w, h);
   if (!framed) {
     const half = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
-    const distance = Math.max(0.28 / half, (0.36 * h) / (half * Math.max(w - left - right, 200)));
+    const distance = Math.max((0.28 * h) / (half * Math.max(h - bottom, 200)), (0.36 * h) / (half * Math.max(w - right, 200)));
     camera.position.copy(controls.target).addScaledVector(new THREE.Vector3(0.75, 0.45, 0.5).normalize(), distance);
     controls.update();
   }
 }
-new ResizeObserver(resize).observe(view);
+const observer = new ResizeObserver(resize);
+observer.observe(view);
+observer.observe(panel);
 resize();
+
+// Section titles fold their section; the header button folds the whole panel.
+for (const button of document.querySelectorAll<HTMLButtonElement>("section h2 button")) {
+  button.onclick = () => {
+    const closed = button.closest("section")!.classList.toggle("closed");
+    button.setAttribute("aria-expanded", String(!closed));
+  };
+}
+const fold = $<HTMLButtonElement>("fold");
+fold.onclick = () => {
+  const folded = panel.classList.toggle("folded");
+  fold.setAttribute("aria-expanded", String(!folded));
+  fold.title = folded ? "Show the panel" : "Hide the panel";
+};
 controls.addEventListener("start", () => (framed = true));
 
 // Simulation state, set once MuJoCo is ready.
@@ -272,7 +288,7 @@ function buildControls(robot: Robot) {
   const buttons = POSES.map((pose) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.innerHTML = `<span class="long">${pose.name}</span><span class="short">${pose.short}</span>`;
+    button.textContent = pose.short;
     button.title = pose.name;
     button.onclick = () => {
       robot.play([pose.ctrl], MOVE_SECONDS, 0);
@@ -318,7 +334,7 @@ function buildControls(robot: Robot) {
         input.value = String(robot.target[i]);
         output.value = `${Math.round(THREE.MathUtils.radToDeg(angles[i]))}°`;
       });
-      clock.textContent = `${robot.data.time.toFixed(1)} s simulated`;
+      clock.textContent = `${robot.data.time.toFixed(1)} s`;
     },
     // While Jev drives the arm, the manual poses and sliders are off.
     lock(locked: boolean) {

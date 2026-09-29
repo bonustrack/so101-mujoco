@@ -1,12 +1,17 @@
 :root {
   --bg: #f1f1ee;
-  --panel: rgba(255, 255, 255, 0.94);
+  --panel: #ffffff;
   --ink: #111111;
   --muted: #6b6b66;
-  --rule: #deded8;
+  --rule: #e4e4de;
   --track: #cfcfc8;
+  --soft: #f6f6f3;
+  --warn: #a3261b;
+  --radius: 4px;
+  --gap: 12px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
-  font-size: 14px;
+  font-size: 13px;
+  line-height: 1.4;
   color: var(--ink);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
@@ -75,16 +80,14 @@ a {
 
 .hint {
   position: absolute;
-  left: 24px;
-  bottom: 20px;
+  left: var(--gap);
+  bottom: var(--gap);
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
   pointer-events: none;
 }
 
-.touch,
-.short {
+.touch {
   display: none;
 }
 
@@ -97,89 +100,137 @@ a {
   }
 }
 
-aside {
+/* The panel: slim, on the right, full height. Its sections fold, and the Flow log takes the room left. */
+#panel {
   position: fixed;
-  top: 20px;
+  top: var(--gap);
+  right: var(--gap);
+  bottom: var(--gap);
   width: 320px;
-  max-height: calc(100% - 40px);
-  overflow-y: auto;
-  padding: 20px;
+  display: flex;
+  flex-direction: column;
   background: var(--panel);
   border: 1px solid var(--rule);
-  border-radius: 8px;
+  border-radius: var(--radius);
 }
 
-#panel {
-  right: 20px;
+@media (min-width: 721px) {
+  #panel.folded {
+    bottom: auto;
+  }
 }
 
-/* The left panel fills the height; its Flow log scrolls on its own so the controls stay in view. */
-#agent {
-  left: 20px;
-  width: 360px;
-  height: calc(100% - 40px);
-  display: flex;
-  flex-direction: column;
+#panel.folded #sections {
+  display: none;
 }
 
-#agent > * {
+#panel header {
   flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px var(--gap);
 }
 
-#agent .flow {
-  flex: 1 1 0;
-  min-height: 180px;
+#panel h1 {
+  flex: 1;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+#panel h1 span {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+#clock {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+#sections {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
-aside header h1 {
-  margin: 0;
-  font-size: 22px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-}
-
-aside header p {
-  margin: 4px 0 0;
-  color: var(--muted);
-  line-height: 1.4;
-}
-
-aside section {
-  margin-top: 18px;
-  padding-top: 14px;
+section {
+  flex: none;
+  padding: 0 var(--gap) 10px;
   border-top: 1px solid var(--rule);
 }
 
-aside h2 {
-  margin: 0 0 10px;
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
+section.closed {
+  padding-bottom: 0;
 }
 
-#poses {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+section.closed > :not(h2) {
+  display: none !important;
+}
+
+section h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Section titles are the fold buttons. */
+section h2 button {
+  flex: 1;
+  display: flex;
+  align-items: center;
   gap: 6px;
+  height: 34px;
+  padding: 0;
+  font-weight: 600;
+  text-align: left;
+  background: none;
+  border: none;
+}
+
+section h2 button::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  margin: 0 3px 2px 1px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(45deg);
+  transition: transform 0.15s;
+}
+
+section.closed h2 button::before {
+  margin-bottom: 0;
+  transform: rotate(-45deg);
 }
 
 button {
   font: inherit;
   color: var(--ink);
-  height: 34px;
-  padding: 0 12px;
+  height: 28px;
+  padding: 0 10px;
   background: #ffffff;
   border: 1px solid var(--rule);
-  border-radius: 6px;
+  border-radius: var(--radius);
   cursor: pointer;
+  white-space: nowrap;
 }
 
 button:hover:not(:disabled) {
   border-color: var(--ink);
+}
+
+section h2 button:hover {
+  color: var(--ink);
 }
 
 button.active,
@@ -194,17 +245,50 @@ button:disabled {
   cursor: default;
 }
 
+button.icon {
+  width: 28px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+button.icon svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  transition: transform 0.15s;
+}
+
+#panel.folded button.icon svg {
+  transform: rotate(180deg);
+}
+
+/* Robot */
+#poses {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+#poses button {
+  padding: 0 4px;
+}
+
 .joint {
   display: grid;
-  grid-template-columns: 96px 1fr 44px;
+  grid-template-columns: 84px 1fr 44px;
   align-items: center;
-  gap: 10px;
-  height: 32px;
+  gap: 8px;
+  height: 26px;
 }
 
 .joint label {
-  color: var(--ink);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .joint output {
@@ -217,7 +301,7 @@ input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
-  height: 20px;
+  height: 18px;
   margin: 0;
   background: transparent;
   cursor: pointer;
@@ -235,17 +319,17 @@ input[type="range"]::-moz-range-track {
 
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
-  margin-top: -6px;
+  width: 12px;
+  height: 12px;
+  margin-top: -5px;
   border: none;
   border-radius: 50%;
   background: var(--ink);
 }
 
 input[type="range"]::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border: none;
   border-radius: 50%;
   background: var(--ink);
@@ -256,57 +340,44 @@ input[type="range"]:disabled {
   cursor: default;
 }
 
-/* Scene editor */
-.scene-buttons {
+/* Scene */
+.scene-buttons,
+.buttons {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.25fr;
-  gap: 6px;
+  grid-template-columns: 1fr 1fr 1.3fr;
+  gap: 4px;
 }
 
-.scene-buttons button {
-  padding: 0 8px;
-  white-space: nowrap;
+.scene-buttons button,
+.buttons button {
+  padding: 0 6px;
 }
 
 .selected {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 12px 0 4px;
+  margin: 8px 0 2px;
 }
 
 .selected strong {
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .joint.size {
-  grid-template-columns: 96px 1fr 52px;
+  grid-template-columns: 84px 1fr 52px;
 }
 
 #grab.warn {
-  color: #a3261b;
+  color: var(--warn);
 }
 
-.row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px solid var(--rule);
-}
-
-#clock {
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
-/* Jev panel */
+/* Jev */
 .field {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 6px;
-  margin-bottom: 6px;
+  grid-template-columns: 1fr 104px auto;
+  gap: 4px;
+  margin-bottom: 4px;
 }
 
 input[type="password"],
@@ -314,25 +385,27 @@ input[type="text"],
 select,
 textarea {
   width: 100%;
+  min-width: 0;
   font: inherit;
   color: var(--ink);
   background: #ffffff;
   border: 1px solid var(--rule);
-  border-radius: 6px;
+  border-radius: var(--radius);
 }
 
 input[type="password"],
 input[type="text"],
 select {
-  height: 34px;
-  padding: 0 10px;
+  height: 28px;
+  padding: 0 8px;
 }
 
 textarea {
   display: block;
-  padding: 8px 10px;
+  min-height: 28px;
+  margin-bottom: 4px;
+  padding: 4px 8px;
   resize: vertical;
-  line-height: 1.4;
 }
 
 input:focus,
@@ -343,69 +416,19 @@ textarea:focus {
 }
 
 .note {
-  margin: 10px 0 0;
+  margin: 6px 0 0;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.buttons {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1.6fr;
-  gap: 6px;
-  margin-top: 8px;
 }
 
 /* Two lines kept free, so a longer message does not shift the Flow log. */
 #status {
-  min-height: 2.9em;
-  margin: 10px 0 0;
+  min-height: 2.8em;
+  margin: 6px 0 0;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-#diagram {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 18px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: 12px;
-}
-
-#diagram li {
-  position: relative;
-  padding: 3px 7px;
-  border: 1px solid var(--rule);
-  border-radius: 4px;
-  background: #ffffff;
-  transition: background 0.15s, color 0.15s;
-}
-
-#diagram li::after {
-  content: "→";
-  position: absolute;
-  left: calc(100% + 4px);
-  color: var(--muted);
-}
-
-#diagram li:last-child::after {
-  content: "↺ back to Observe";
-  white-space: nowrap;
-}
-
-#diagram li.on {
-  background: var(--ink);
-  border-color: var(--ink);
-  color: #ffffff;
 }
 
 details {
-  margin-top: 8px;
-  font-size: 12px;
+  margin-top: 4px;
 }
 
 summary {
@@ -421,93 +444,157 @@ pre {
   max-height: 240px;
   overflow: auto;
   margin: 6px 0 0;
-  padding: 8px 10px;
-  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  background: #f7f7f4;
+  padding: 6px 8px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--soft);
   border: 1px solid var(--rule);
-  border-radius: 6px;
+  border-radius: var(--radius);
+}
+
+/* Flow: the loop diagram lights up the live stage; the log scrolls on its own and takes the room left. */
+section.flow:not(.closed) {
+  flex: 1 1 0;
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+}
+
+section.flow > * {
+  flex: none;
+}
+
+#cost-short {
+  overflow: hidden;
+  color: var(--muted);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+#cost {
+  margin: 6px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+
+#cost span {
+  display: inline-block;
+  width: 56px;
+  color: var(--ink);
+}
+
+#diagram {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 13px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+#diagram li {
+  position: relative;
+  padding: 0 5px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  transition: background 0.15s, color 0.15s;
+}
+
+#diagram li::after {
+  content: "›";
+  position: absolute;
+  left: calc(100% + 4px);
+  color: var(--muted);
+}
+
+#diagram li:last-child::after {
+  content: "↺";
+}
+
+#diagram li.on {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #ffffff;
 }
 
 #flow {
   flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
-  margin: 0;
+  margin: 8px 0 0;
   padding: 0;
   list-style: none;
 }
 
 #flow > li + li {
-  margin-top: 10px;
-  padding-top: 10px;
+  margin-top: 8px;
+  padding-top: 8px;
   border-top: 1px solid var(--rule);
 }
 
 #flow .empty {
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
 }
 
 #flow h3 {
-  margin: 0 0 2px;
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 #flow p {
-  margin: 6px 0 0;
-  line-height: 1.4;
+  margin: 4px 0 0;
 }
 
 #flow .meta {
   display: block;
   color: var(--muted);
-  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 #flow .tag {
   display: inline-block;
-  width: 52px;
+  width: 48px;
   color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+}
+
+#flow details {
+  color: var(--muted);
 }
 
 #flow .ok,
 #flow .end.success {
-  font-weight: 500;
+  font-weight: 600;
 }
 
 #flow .end.error {
-  color: #a3261b;
+  color: var(--warn);
 }
 
 /* Jev's probabilities: one series, so the bars carry no legend; values sit at the tip. */
 .bars {
-  margin-top: 6px;
+  margin-top: 4px;
 }
 
 .bar-row {
   display: grid;
-  grid-template-columns: 112px 1fr 34px;
+  grid-template-columns: 124px 1fr 32px;
   align-items: center;
   gap: 8px;
   height: 18px;
-  font-size: 12px;
   color: var(--muted);
+}
+
+.bar-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .bar-row i {
   display: block;
-  height: 6px;
+  height: 5px;
   min-width: 2px;
   background: var(--ink);
-  border-radius: 0 3px 3px 0;
 }
 
 .bar-row + .bar-row i {
@@ -521,97 +608,42 @@ pre {
 }
 
 footer {
-  margin-top: 16px;
+  flex: none;
+  margin-top: auto;
+  padding: 8px var(--gap);
+  border-top: 1px solid var(--rule);
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
-@media (min-width: 1001px) {
+/* Phones: the view fills the screen and the panel is a bottom sheet. The header folds it. */
+@media (max-width: 720px) {
+  :root {
+    --gap: 10px;
+  }
   .hint {
-    left: 404px;
+    top: var(--gap);
+    bottom: auto;
   }
-}
-
-/* Narrow screens: the view stays on top, the panels scroll below it. */
-@media (max-width: 1000px) {
-  html,
-  body {
-    height: auto;
-    overflow: auto;
-  }
-  #view {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    height: 52svh;
-    background: var(--bg);
-  }
-  aside {
-    position: static;
+  #panel {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
     width: auto;
-    max-height: none;
-    overflow: visible;
-    border: none;
-    border-top: 1px solid var(--rule);
+    max-height: 56svh;
+    border-width: 1px 0 0;
     border-radius: 0;
-    background: #ffffff;
+    padding-bottom: env(safe-area-inset-bottom);
   }
-  #agent,
-  #agent .flow {
-    width: auto;
-    height: auto;
+  section.flow:not(.closed) {
+    flex: none;
     min-height: 0;
     display: block;
   }
   #flow {
-    overflow: visible;
-  }
-}
-
-/* Phones: tighter panels. */
-@media (max-width: 720px) {
-  .hint {
-    left: 16px;
-    bottom: 10px;
-  }
-  aside {
-    padding: 14px 16px;
-  }
-  #panel {
-    padding-bottom: calc(12px + env(safe-area-inset-bottom));
-  }
-  aside header h1 {
-    font-size: 16px;
-  }
-  #panel header p {
-    display: none;
-  }
-  aside section {
-    margin-top: 12px;
-    padding-top: 10px;
-  }
-  #poses {
-    grid-template-columns: repeat(4, 1fr);
-  }
-  #poses button {
-    padding: 0 4px;
-    font-size: 13px;
-  }
-  .long {
-    display: none;
-  }
-  .short {
-    display: inline;
-  }
-  .joint {
-    height: 30px;
-  }
-  .row {
-    margin-top: 10px;
-    padding-top: 10px;
+    max-height: 34svh;
   }
   footer {
-    margin-top: 8px;
+    margin-top: 0;
   }
 }

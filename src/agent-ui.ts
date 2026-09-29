@@ -1,12 +1,21 @@
-// The left panel: Jev key and model, the goal, Run and Stop, and a live log of every turn.
-import { MAX_TURNS, QUESTIONS, runAgent, type AgentEvent } from "./agent";
-import { askJev, listModels } from "./jev";
+// The Jev and Flow sections: key and model, the goal, Run and Stop, a live log of every turn, and what the calls cost.
+import { MAX_TURNS, QUESTIONS, runAgent, type AgentEvent, type JevResponse } from "./agent";
+import { PRICE_NOTE, askJev, jevCost, listModels } from "./jev";
 import type { Obj, Robot } from "./robot";
 
 const KEY = "jev-api-key";
 const MODEL = "jev-model";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const round = (n: number) => n.toFixed(2);
+const count = (n: number) => n.toLocaleString("en-US");
+const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumSignificantDigits: 2 });
+
+// Jev calls, tokens and dollars, for one run or the whole visit. Calls on a model with no published price stay unpriced.
+type Tally = { calls: number; input: number; output: number; usd: number; unpriced: number };
+const tally = (): Tally => ({ calls: 0, input: 0, output: 0, usd: 0, unpriced: 0 });
+const price = (t: Tally) =>
+  t.unpriced === 0 ? usd.format(t.usd) : t.unpriced === t.calls ? "cost unknown" : `${usd.format(t.usd)} + ${t.unpriced} unpriced`;
+const spent = (t: Tally) => `${t.calls} ${t.calls === 1 ? "call" : "calls"} · ${count(t.input)} in / ${count(t.output)} out · ${price(t)}`;
 
 // Jev's target is the selected object, else the first box, else the first object.
 export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (locked: boolean) => void) {
@@ -20,6 +29,27 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   const flow = $("flow");
   const stages = [...$("diagram").querySelectorAll<HTMLElement>("li")];
   $("question").textContent = JSON.stringify(QUESTIONS, null, 2);
+  const cost = $("cost");
+  const costShort = $("cost-short"); // the session total, in view when Flow is folded
+  $("price").textContent = `Cost uses TypeSafe's published price. ${PRICE_NOTE}. Other models show their tokens and "cost unknown".`;
+  const sessionCost = tally();
+  let runCost = tally();
+  const charge = (model: string, usage: JevResponse["usage"]) => {
+    const dollars = jevCost(model, usage);
+    for (const t of [runCost, sessionCost]) {
+      t.calls++;
+      t.input += usage?.input_tokens ?? 0;
+      t.output += usage?.output_tokens ?? 0;
+      if (dollars === null) t.unpriced++;
+      else t.usd += dollars;
+    }
+    showCost();
+    return dollars;
+  };
+  const showCost = () => {
+    cost.innerHTML = `<span>Run</span>${spent(runCost)}<br><span>Session</span>${spent(sessionCost)}`;
+    costShort.textContent = price(sessionCost);
+  };
 
   let controller: AbortController | null = null;
   // The log follows new turns only while the reader stays at its bottom.
@@ -105,6 +135,8 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
     idle();
     flow.replaceChildren();
     follow = true;
+    runCost = tally();
+    showCost();
     $<HTMLDetailsElement>("how").open = false; // room for the log; the diagram stays in view
     highlight("goal");
     let current: HTMLElement = flow;
@@ -142,8 +174,10 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
             )
             .join("");
           const unsure = event.answer.confidence < 0.5;
+          const dollars = charge(event.model, event.usage);
+          const tokens = event.usage ? `${count(event.usage.input_tokens)} in + ${count(event.usage.output_tokens)} out tokens` : "no token count";
           add(
-            `<p>Jev chose <strong>${event.answer.choice}</strong><span class="meta">confidence ${round(event.answer.confidence)} · ${Math.round(event.ms)} ms · ${escape(event.model)}</span></p><div class="bars" aria-label="Jev's top probabilities">${bars}</div>` +
+            `<p>Jev chose <strong>${event.answer.choice}</strong><span class="meta">confidence ${round(event.answer.confidence)} · ${Math.round(event.ms)} ms · ${escape(event.model)}</span><span class="meta">${tokens} · ${dollars === null ? "cost unknown" : usd.format(dollars)}</span></p><div class="bars" aria-label="Jev's top probabilities">${bars}</div>` +
               (unsure ? `<p class="meta">Low confidence: Jev is not sure, the top choice runs anyway.</p>` : ""),
             unsure ? "unsure" : "",
           );

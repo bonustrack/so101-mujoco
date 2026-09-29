@@ -21,3 +21,15 @@ export const askJev = (key: string, request: JevRequest, signal: AbortSignal) =>
 // GET /v1/models lists the names the account can send, currently the aliases.
 export const listModels = async (key: string) =>
   (await call<{ models: { name: string }[] }>(key, { method: "GET" })).models.map((m) => m.name);
+
+// TypeSafe's published price per token, by the versioned model ID a response names (docs.typesafe.ai/models,
+// checked 2026-09-29): Jev 1.13 costs $0.042 per million input tokens, and output tokens are free.
+// A model not listed here has no known price: the page shows its tokens and "cost unknown".
+const PRICES: Record<string, { input: number; output: number }> = { "jev-1.13.0": { input: 0.042e-6, output: 0 } };
+export const PRICE_NOTE = "Jev 1.13: $0.042 per million input tokens, output tokens free (docs.typesafe.ai/models)";
+
+// Dollars for one call, or null when the model's price or the token count is unknown.
+export function jevCost(model: string, usage: JevResponse["usage"]) {
+  const price = PRICES[model];
+  return price && usage ? usage.input_tokens * price.input + usage.output_tokens * price.output : null;
+}

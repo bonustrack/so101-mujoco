@@ -27,9 +27,11 @@ export const MAX_TURNS = 12;
 const cm = (m: number) => Math.round(m * 1000) / 10;
 
 // The commands Jev chooses from. The text is what Jev reads; `run` is what the arm does.
+// Each text names the exact observation values that make the command right, because Jev reads
+// criteria literally: vaguer wording let lower_to_box come close to winning while the gripper was away.
 export const COMMANDS: Record<string, { text: string; run?: (robot: Robot, stage: (s: Stage) => void) => Promise<string> }> = {
   open_gripper: {
-    text: "Open the jaws wide. Use it when `observation.gripper` is closed and the box is not held yet.",
+    text: 'Open the jaws wide. Right when `observation.gripper` is "closed" or "partly open" and `observation.gripper_vs_box` is not "holding the box". Wrong when `observation.gripper` is already "open".',
     run: async (robot, stage) => {
       stage("physics");
       const held = robot.contacts();
@@ -38,7 +40,7 @@ export const COMMANDS: Record<string, { text: string; run?: (robot: Robot, stage
     },
   },
   move_above_box: {
-    text: "Move the gripper to just above the box, fingers pointing down. Use it when `observation.gripper_vs_box` says the gripper is away from the box.",
+    text: 'Move the gripper to hover just above the box, fingers pointing down. Right when `observation.gripper_vs_box` is "away from the box".',
     run: async (robot, stage) => {
       stage("ik");
       const box = robot.box();
@@ -54,7 +56,7 @@ export const COMMANDS: Record<string, { text: string; run?: (robot: Robot, stage
     },
   },
   lower_to_box: {
-    text: "Lower the open gripper straight down around the box. Use it when `observation.gripper_vs_box` says the gripper is above the box and the jaws are open.",
+    text: 'Lower the gripper straight down so the box ends up between the jaws. Right only when `observation.gripper_vs_box` is "above the box" and `observation.gripper` is "open". Wrong when the jaws are closed or the gripper is away from the box: it would hit the box.',
     run: async (robot, stage) => {
       stage("ik");
       const box = robot.box();
@@ -66,7 +68,7 @@ export const COMMANDS: Record<string, { text: string; run?: (robot: Robot, stage
     },
   },
   close_gripper: {
-    text: "Close the jaws to grip. Use it when `observation.gripper_vs_box` says the box is between the jaws.",
+    text: 'Close the jaws to grip. Right when `observation.gripper_vs_box` is "the box is between the jaws".',
     run: async (robot, stage) => {
       stage("physics");
       await robot.play([[...robot.target.slice(0, GRIPPER), CLOSED]], 0.8, 0.4);
@@ -75,7 +77,7 @@ export const COMMANDS: Record<string, { text: string; run?: (robot: Robot, stage
     },
   },
   lift: {
-    text: "Raise the gripper 8 cm, carrying what it holds. Use it when `observation.gripper_vs_box` says the gripper is holding the box.",
+    text: 'Raise the gripper 8 cm, carrying what it holds. Right when `observation.gripper_vs_box` is "holding the box" and `observation.box` is "standing on the table".',
     run: async (robot, stage) => {
       stage("ik");
       const tip = robot.tcp();
@@ -86,14 +88,16 @@ export const COMMANDS: Record<string, { text: string; run?: (robot: Robot, stage
     },
   },
   go_home: {
-    text: "Fold the arm back to its rest pose. Use it when `goal` asks for the rest pose.",
+    text: "Fold the arm back to its rest pose. Right only when `goal` asks for the rest pose.",
     run: async (robot, stage) => {
       stage("physics");
       await robot.play([[...REST.slice(0, GRIPPER), robot.target[GRIPPER]]], 1.5);
       return "Back at rest.";
     },
   },
-  done: { text: "Stop, nothing left to do. Use it when `goal` is achieved in `observation`." },
+  done: {
+    text: 'Stop, nothing left to do. Right when `observation` shows `goal` is achieved. To take the box, that means `observation.box` says lifted and `observation.gripper_vs_box` is "holding the box".',
+  },
 };
 
 // One question per turn. Instructions point at state fields by name, as the TypeSafe docs advise.

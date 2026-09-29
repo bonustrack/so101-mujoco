@@ -325,7 +325,9 @@ textarea:focus {
   margin-top: 8px;
 }
 
+/* Two lines kept free, so a longer message does not shift the Flow log. */
 #status {
+  min-height: 2.9em;
   margin: 10px 0 0;
   color: var(--muted);
   font-size: 12px;

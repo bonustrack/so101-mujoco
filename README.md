@@ -21,7 +21,7 @@ The arm rides on a 21 x 14 cm chassis of 2 kg on 4 wheels, a free body on the fl
 
 The panel lets [Jev](https://docs.typesafe.ai) (TypeSafe AI's System One model) drive the arm. Paste a TypeSafe API key, type a goal and press Run. Goals it handles:
 
-- Take one object: "Take the box", "lift the ball", "grab Box 2".
+- Take one object: "Take the box", "lift the ball", "grab Box 2". The goal wins over the selection: the selected object only fills in "it" or "this".
 - Stack the boxes: "Stack all the boxes together". Biggest at the bottom unless the goal asks otherwise.
 - Stack everything: boxes, then one ball on top (nothing stays on a ball).
 - Put one object on another: "Put Box 2 on Box 1".
@@ -58,8 +58,11 @@ bun install
 bun run dev      # http://localhost:5173
 bun run build    # static site in dist/
 bun run check    # type check
-bun run check-agent  # headless: scripted picks, the scene editor, the loop with a mocked Jev (take, stack, put on, a fallen box), Stop, the base (steps, brake, bumps, drive then pick), WASM memory, the proxy
+bun run check-agent  # headless: scripted picks, the scene editor, the loop with a mocked Jev (take, stack, put on, a fallen box), Stop, the base (steps, brake, bumps, drive then pick), a quick bench, WASM memory, the proxy
+bun run bench        # the benchmark gate: 20 random scenes per family, headless, on all cores
 ```
+
+`bun run bench` runs every task family of `scripts/bench-core.ts` on random scenes with a perfect "rules" decider, prints clean success, task time, Jev calls, base contacts and chassis tilt against the targets, and fails under the gate. `--mode jev` asks the real Jev instead (key from `~/.secrets/jev-key`, or the file in `JEV_KEY_FILE`). A run is clean when it succeeds and nothing else moved more than 2 cm, fell over or rolled under the base.
 
 ## Deploy
 

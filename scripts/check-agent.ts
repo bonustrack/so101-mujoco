@@ -6,6 +6,7 @@ import { COMMANDS, maxTurns, observe, question, runAgent, type AgentEvent, type 
 import { plan, type Task } from "../src/plan";
 import { STEP, TURN, createRobot, loadModel, type Obj, type Vec3 } from "../src/robot";
 import jevFunction from "../netlify/functions/jev";
+import { QUICK, createBench } from "./bench-core";
 
 const dir = new URL("../model/", import.meta.url).pathname;
 const files = ["scene_web.xml", "so101.xml", ...readdirSync(dir + "assets").map((f) => "assets/" + f)].map(
@@ -245,11 +246,26 @@ events = await loop(
   },
   undefined,
   "Take the ball",
-  reading("take"),
+  reading("take", { object: ball.label }),
   ball,
 );
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 report(end.outcome === "success" && robot.focus === ball && seen === `ball {"diameter":5}`, "loop takes a dragged, resized ball", `${seen}: ${end.text}`);
+
+// The goal wins over the selection: "take the ball" with a box selected takes the ball. Must pass.
+fresh();
+robot.add("box");
+const wanted = robot.add("ball")!;
+robot.focus = null;
+events = await loop(reactive, undefined, "take the ball", reading("take", { object: wanted.label }), robot.active()[0]);
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+report(end.outcome === "success" && robot.gripped(wanted), "take the ball with a box selected takes the ball", `holding ${robot.active().find(robot.gripped)?.label ?? "nothing"}: ${end.text}`);
+// "Take it" with a box selected: Jev names the selection, the robot takes it.
+fresh();
+const it = robot.add("box")!;
+events = await loop(reactive, undefined, "take it", reading("take", { object: it.label }), it);
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+report(end.outcome === "success" && robot.gripped(it), "take it with a box selected takes that box", end.text);
 
 // 7. Stop mid-run.
 fresh();
@@ -440,6 +456,13 @@ settle(0.5);
 events = await loop(placer, undefined, "stack all the boxes", reading("stack_boxes"));
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 report(end.outcome === "success", "stack 3 boxes after the base has turned", end.text);
+// The quick bench: random scenes from the bench families that must end clean.
+const bench = createBench(robot);
+for (const { family, seeds } of QUICK)
+  for (const seed of seeds) {
+    const r = await bench.run(family, seed, "rules");
+    report(r.clean, `bench ${family} #${seed} ends clean`, `${r.outcome} in ${r.taskSeconds} s: ${r.endText}${r.events.length ? ` | ${r.events.map((e) => e.kind).join(",")}` : ""}`);
+  }
 // Every run above frees what it reads from the WASM heap.
 const growth = (heap() - heapStart) / 1e6;
 report(growth < 64, "WASM memory stays flat across all runs", `${(heapStart / 1e6).toFixed(0)} MB at start, +${growth.toFixed(0)} MB`);

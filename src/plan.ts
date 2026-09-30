@@ -162,8 +162,8 @@ export function readTask(robot: Robot, answers: ParseAnswers, selected: Obj | nu
   const find = (label?: string) => robot.active().find((o) => o.label === label) ?? null;
   const fail = (text: string) => ({ task: null, name, confidence, text });
   if (name === "take") {
-    // The selected object wins, as before; Jev's pick only counts when nothing is selected.
-    const object = selected?.active ? selected : (find(answers.object?.choice) ?? robot.pickTarget(null));
+    // The goal wins: Jev reads the selection only when the goal does not single an object out ("take it").
+    const object = find(answers.object?.choice) ?? robot.pickTarget(selected);
     if (!object) return fail("No object to take. Add a box or a ball.");
     const why = robot.tooBig(object);
     if (why) return fail(`${object.label} is too big to grab: ${why}.`);

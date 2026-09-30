@@ -18,7 +18,7 @@ const price = (t: Tally) =>
   t.unpriced === 0 ? usd.format(t.usd) : t.unpriced === t.calls ? "cost unknown" : `${usd.format(t.usd)} + ${t.unpriced} unpriced`;
 const spent = (t: Tally) => `${t.calls} ${t.calls === 1 ? "call" : "calls"} · ${count(t.input)} in / ${count(t.output)} out · ${price(t)}`;
 
-// Taking one object, Jev's target is the selected object, else the one the goal names, else the first box.
+// Taking one object, Jev's target is the one the goal names, else the selected object, else the first box.
 export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (locked: boolean) => void) {
   const key = $<HTMLInputElement>("jev-key");
   const model = $<HTMLSelectElement>("jev-model");
@@ -129,7 +129,6 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
     // The selection is read once, at the start: selecting another object mid-run changes nothing.
     const chosen = selected();
     robot.focus = next;
-    if (chosen && /^Take the (box|ball)$/.test(goal.value.trim())) goal.value = `Take the ${chosen.kind}`;
     controller = new AbortController();
     lock(true);
     idle();

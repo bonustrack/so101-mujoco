@@ -148,7 +148,8 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   let dragged: { o: Obj; pose: number[] } | null = null;
   let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void; until?: () => boolean } | null = null;
   // A base move: its start pose, how far it has turned so far, and when it stopped (-1 while it runs).
-  type Rolling = { kind: "drive" | "turn"; amount: number; x: number; y: number; yaw: number; last: number; turned: number; start: number; stopped: number; before: Set<Obj>; bumped: Obj | null; done: (moved: Moved) => void };
+  // `before`: the objects it touched at the start, with where they stood then.
+  type Rolling = { kind: "drive" | "turn"; amount: number; x: number; y: number; yaw: number; last: number; turned: number; start: number; stopped: number; before: Map<Obj, number[]>; bumped: Obj | null; done: (moved: Moved) => void };
   let rolling: Rolling | null = null;
   let ticks = 0;
   // Parked, the base is braked: the "brake" weld in scene_web.xml holds the chassis where it stopped. Driving
@@ -204,7 +205,8 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   };
   // One control tick of a base move: wheel speeds from the chassis pose, a feedback loop that ramps up,
   // cruises, slows down on the target and holds the heading when driving straight. It stops on target,
-  // on a timeout, or when the robot bumps into an object it was not touching at the start.
+  // on a timeout, when the robot bumps into an object it was not touching at the start, or when an object
+  // it touched at the start moves 4 mm: it never pushes.
   const roll = (r: Rolling) => {
     const b = base();
     r.turned += wrap(b.yaw - r.last);
@@ -220,8 +222,10 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     if (!near) {
       if (Math.abs(left) < (drive ? 0.002 : 0.004)) r.stopped = data.time;
       if (t > 2 + 1.5 * Math.abs(r.amount) * (drive ? 1 / SPEED : 1)) r.stopped = data.time;
-      if (r.stopped < 0 && ticks % 4 === 0) {
-        const hit = [...bumping()].find((o) => !r.before.has(o));
+      if (r.stopped < 0 && ticks % 2 === 0) {
+        const hit =
+          [...bumping()].find((o) => !r.before.has(o)) ??
+          [...r.before].find(([o, [x, y]]) => Math.hypot(data.xpos[3 * o.body] - x, data.xpos[3 * o.body + 1] - y) > 0.004)?.[0];
         if (hit) {
           r.bumped = hit;
           r.stopped = data.time;
@@ -341,12 +345,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
 
     // The base: drive `amount` metres straight ahead (negative: back), or turn `amount` radians on the spot
     // (positive: left). The arm holds its pose meanwhile. Resolves in simulated time, once the wheels have
-    // held still for 0.3 s, with how far it went and the object it bumped into, if any.
+    // held still for 0.3 s, with how far it went and the object it bumped into or pushed, if any.
     move(kind: "drive" | "turn", amount: number) {
       robot.stopBase();
       return new Promise<Moved>((done) => {
         const { x, y, yaw } = base();
-        rolling = { kind, amount, x, y, yaw, last: yaw, turned: 0, start: data.time, stopped: -1, before: bumping(), bumped: null, done };
+        const before = new Map([...bumping()].map((o) => [o, [data.xpos[3 * o.body], data.xpos[3 * o.body + 1]]]));
+        rolling = { kind, amount, x, y, yaw, last: yaw, turned: 0, start: data.time, stopped: -1, before, bumped: null, done };
         release();
       });
     },

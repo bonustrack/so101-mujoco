@@ -35,10 +35,11 @@ export type Spot = "here" | { x: number; y: number; label: string };
 // at the jaw tips, against 8 cm at 16 cm out. A tower is built in that ring.
 export const BEST = 0.22;
 const RING = [0.18, 0.26];
-// Where the arm works on the floor: 14 to 26 cm from its base, up to about 90° to either side (the shoulder
-// pans 110°). Farther, the base drives up until the object is 20 cm straight ahead.
+// Where the arm works on the floor: 14 to 26 cm from its base, up to 77° to either side. Scripted picks
+// work up to 80°, half of them at 85°, none at 90°. Farther, the base drives up until the object is 20 cm
+// straight ahead.
 export const REACH = [0.14, 0.26];
-const SIDE = 1.6;
+const SIDE = 1.35;
 const PICK = 0.2;
 export const inReach = (robot: Robot, p: ArrayLike<number>, ring = REACH) => {
   const { r, a } = robot.polar(p);

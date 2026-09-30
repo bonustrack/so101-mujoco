@@ -389,7 +389,7 @@ function repeats(events: AgentEvent[]) {
   let last = "";
   let sub = "";
   for (const e of events) {
-    if (e.type === "turn") sub = e.subgoal;
+    if (e.type === "turn" || e.type === "skill") sub = e.subgoal;
     if (e.type !== "result") continue;
     const key = `${sub}|${e.command}|${e.text}`;
     const counts = !STEPS.includes(e.command) || /Stopped early/.test(e.text);
@@ -414,7 +414,9 @@ function readingMatches(text: string, c: Case) {
 // The quick subset `bun run check-agent` runs: families and seeds that must end clean.
 export const QUICK: { family: string; seeds: number[] }[] = [
   { family: "near_take_ball_selected", seeds: [1001, 1013] },
-  { family: "near_take_named", seeds: [1002] },
+  { family: "blocked_take", seeds: [1000, 1012] },
+  { family: "forward_blocked", seeds: [1010, 1022] },
+  { family: "turn_clutter", seeds: [1002, 1014] },
   { family: "far_take", seeds: [1005] },
 ];
 
@@ -475,7 +477,7 @@ export const TARGETS = {
   container: 90, // % success
 };
 // The floor each phase ships on: raised as the phases land.
-export const GATE = { clean: 68, wrongObject: 100 };
+export const GATE = { clean: 92, wrongObject: 100, noBaseTouch: 98, maxTilt: 5 };
 
 export function gate(s: Summary, floor: { [k: string]: number } = GATE) {
   const fails: string[] = [];

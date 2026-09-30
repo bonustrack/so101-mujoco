@@ -410,6 +410,12 @@ fresh();
 robot.place(robot.focus!, 0.12, 0, 0);
 base = await drive(robot.move("drive", STEP));
 report(base.bumped === robot.focus && base.moved > 0.01 && base.moved < 0.05, "the base stops when it bumps into a box", `${(base.moved * 100).toFixed(1)} cm, touched ${base.bumped?.label ?? "nothing"}`);
+// Driving on into the box it touches stops at once: the base never pushes.
+await drive(robot.hold(0.5));
+const touchedAt = robot.object(robot.focus!).world;
+base = await drive(robot.move("drive", STEP));
+const pushed = Math.hypot(robot.object(robot.focus!).world[0] - touchedAt[0], robot.object(robot.focus!).world[1] - touchedAt[1]);
+report(base.bumped === robot.focus && pushed < 0.01, "driving on into a box it touches stops: it never pushes", `pushed ${(pushed * 100).toFixed(1)} cm`);
 
 // Jev's drive commands, with a mock that reads the observation the way the criteria describe.
 const driver: Decide = async (request, signal) => {
@@ -424,12 +430,14 @@ events = await loop(driver, undefined, "go forward 20 cm", reading("drive", { mo
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 p1 = pose();
 let steps = events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : []));
-report(end.outcome === "success" && Math.abs(Math.hypot(p1.x - p0.x, p1.y - p0.y) - 0.2) < 0.01 && steps.join() === "drive_forward,drive_forward", "Jev drives forward 20 cm in two steps", `${steps.join(" > ")}: ${end.text}`);
+// Code drives a move asked for in the goal: one planned drive, no Jev call after the reading.
+let drives = events.flatMap((e) => (e.type === "result" && (e.command === "drive" || e.command === "drive_to_object") ? [e.command] : []));
+report(end.outcome === "success" && Math.abs(Math.hypot(p1.x - p0.x, p1.y - p0.y) - 0.2) < 0.01 && steps.length === 0 && drives.length === 1, "the base drives forward 20 cm, planned in code", `${drives.join(" > ")}: ${end.text}`);
 p0 = pose();
 events = await loop(driver, undefined, "turn left", reading("drive", { move: "left" }));
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 p1 = pose();
-report(end.outcome === "success" && Math.abs(deg(p1.yaw - p0.yaw) - 15) < 2, "Jev turns left 15°", `${deg(p1.yaw - p0.yaw).toFixed(1)}°: ${end.text}`);
+report(end.outcome === "success" && Math.abs(deg(p1.yaw - p0.yaw) - 15) < 2, "the base turns left 15°", `${deg(p1.yaw - p0.yaw).toFixed(1)}°: ${end.text}`);
 // Drive, then pick: a box 60 cm away to the front left, out of reach.
 fresh();
 robot.place(robot.focus!, 0.55, 0.3, 0.4);
@@ -438,7 +446,8 @@ events = await loop(driver, undefined, "drive to the box and pick it up", readin
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 steps = events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : []));
 const drove = events.some((e) => e.type === "plan" && e.plan.steps[0]?.text === "Drive to Box 1");
-report(end.outcome === "success" && robot.held() && drove && steps[0] === "drive_to_object", "drive to a box out of reach, then pick it up", `${steps.join(" > ")}: ${end.text}`);
+drives = events.flatMap((e) => (e.type === "result" && e.command === "drive_to_object" ? [e.text] : []));
+report(end.outcome === "success" && robot.held() && drove && drives.length === 1 && steps[0] === "move_above_object", "drive to a box out of reach, then pick it up", `${drives[0]} ${steps.join(" > ")}: ${end.text}`);
 // Put a far box on a near one: drive to it, take it, carry it back on the base, set it down.
 const [near, far] = scene(["box", "box"], false);
 robot.place(near, 0.2, 0.12, 0);
@@ -447,7 +456,8 @@ robot.reset();
 events = await loop(driver, undefined, `put ${far.label} on ${near.label}`, reading("put_on", { object: far.label, onto: near.label }));
 end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
 steps = events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : []));
-report(end.outcome === "success" && steps.filter((c) => c === "drive_to_object").length === 2, "put a far box on a near one, driving both ways", `${steps.join(" > ")}: ${end.text}`);
+drives = events.flatMap((e) => (e.type === "result" && e.command === "drive_to_object" ? [e.text] : []));
+report(end.outcome === "success" && drives.length === 2, "put a far box on a near one, driving both ways", `${drives.length} drives, ${steps.join(" > ")}: ${end.text}`);
 // Stacking still works after the base has moved: three boxes in front of the base where it now stands.
 scene(["box", "box", "box"], false);
 await drive(robot.move("turn", -2 * TURN));

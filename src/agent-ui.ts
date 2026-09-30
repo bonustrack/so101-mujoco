@@ -30,7 +30,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   const flow = $("flow");
   const stages = [...$("diagram").querySelectorAll<HTMLElement>("li")];
   $("question").textContent = JSON.stringify(
-    { read_the_goal: { task: TASKS }, take_one_object: question("take"), put_one_on_another: question("place"), drive: question("drive"), drive_up_to: question("approach") },
+    { read_the_goal: { task: TASKS }, take_one_object: question("take"), put_one_on_another: question("place") },
     null,
     2,
   );
@@ -228,6 +228,14 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
           sent("goal, observation, history", event.request.state);
           break;
         }
+        case "skill": {
+          // Code drives the base on its own: a path on a map of the floor, no Jev call.
+          turn = event.turn;
+          current = document.createElement("li");
+          current.innerHTML = `<h3>Turn ${event.turn} <span class="meta-inline">${escape(event.subgoal)}, planned in code</span></h3>`;
+          flow.append(current);
+          break;
+        }
         case "decision": {
           highlight("command");
           const unsure = event.answer.confidence < 0.5;
@@ -291,6 +299,8 @@ const END_TEXT: Record<Extract<AgentEvent, { type: "end" }>["outcome"], string> 
   done: "Jev stopped.",
   stopped: "Stopped.",
   turns: "Out of turns.",
+  stuck: "Stuck.",
+  budget: "Out of time.",
   error: "Error.",
 };
 

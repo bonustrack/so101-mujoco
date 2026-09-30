@@ -112,8 +112,11 @@ export async function runAgent(options: {
     let current = plan(robot, task);
     emit({ type: "plan", plan: current });
     const started = robot.data.time;
-    const tried = new Map<string, string[]>(); // step text -> how each failed try ended
-    const retried = new Set<string>();
+    // Per step: failed tries per way, how each failed try ended, and how many tries each way gets (1, then 2
+    // once Jev says retry). So no way runs more than twice.
+    const fails = new Map<string, number[]>();
+    const tried = new Map<string, string[]>();
+    const rounds = new Map<string, number>();
     for (;;) {
       if (signal.aborted) return end("stopped", "Stop pressed.");
       if (!current.current) {
@@ -132,12 +135,14 @@ export async function runAgent(options: {
       if (sub.kind !== "drive" && !sub.object.active) return end("error", `${sub.object.label} was deleted.`);
       const skill: Skill = sub.kind === "drive" || sub.kind === "approach" ? "drive" : sub.kind === "take" ? "pick" : "place";
       const failed = tried.get(sub.text) ?? [];
-      if (failed.length >= HOW[skill].length) {
+      const counts = fails.get(sub.text) ?? HOW[skill].map(() => 0);
+      let way = counts.findIndex((n) => n < (rounds.get(sub.text) ?? 1));
+      if (way < 0) {
         // 3. Code has no way left: Jev chooses.
         const canSkip = sub.kind === "place" && ((task.kind === "stack" && task.objects.indexOf(sub.object) > 0 && task.objects.length > 2) || (task.kind === "put_in" && task.objects.length > 1));
         const request: JevRequest = {
           model,
-          state: { goal, step: sub.text, tried: failed, steps_left: current.steps.filter((s) => !s.done && s.text !== sub.text).map((s) => s.text), already_retried: retried.has(sub.text) ? "yes" : "no" },
+          state: { goal, step: sub.text, tried: failed, steps_left: current.steps.filter((s) => !s.done && s.text !== sub.text).map((s) => s.text), already_retried: rounds.has(sub.text) ? "yes" : "no" },
           questions: recoveryQuestion(canSkip),
         };
         stage("jev");
@@ -145,9 +150,9 @@ export async function runAgent(options: {
         const answer = response.answers?.recovery;
         if (answer?.type !== "choice" || !(answer.choice in request.questions.recovery.criteria)) throw new Error(`Unexpected answer from Jev: ${JSON.stringify(response).slice(0, 200)}`);
         emit({ type: "recovery", request, answer, model: response.model, ms, usage: response.usage });
-        if (answer.choice === "retry" && !retried.has(sub.text)) {
-          retried.add(sub.text);
-          tried.set(sub.text, []);
+        if (answer.choice === "retry" && !rounds.has(sub.text)) {
+          rounds.set(sub.text, 2);
+          way = counts.findIndex((n) => n < 2);
         } else if (answer.choice === "skip" && (task.kind === "stack" || task.kind === "put_in") && sub.kind === "place") {
           task.objects = task.objects.filter((o) => o !== sub.object);
           task.skipped.push(`${sub.object.label} left out: ${failed.at(-1)}`);
@@ -156,11 +161,10 @@ export async function runAgent(options: {
           continue;
         } else return end("stuck", `Could not ${sub.text.charAt(0).toLowerCase() + sub.text.slice(1)}. ${failed.at(-1) ?? ""}`.trim());
       }
-      const attempt = (tried.get(sub.text) ?? []).length;
       steps++;
       robot.focus = sub.kind === "drive" ? null : sub.object;
-      emit({ type: "skill", step: steps, skill, subgoal: sub.text, attempt: attempt + 1, how: HOW[skill][attempt] });
-      const outcome = await run(ctx, sub, attempt);
+      emit({ type: "skill", step: steps, skill, subgoal: sub.text, attempt: failed.length + 1, how: HOW[skill][way] });
+      const outcome = await run(ctx, sub, way);
       if (signal.aborted) return end("stopped", "Stop pressed.");
 
       // 4. Check the step, then plan again from what the physics shows now.
@@ -171,7 +175,11 @@ export async function runAgent(options: {
       if (sub.kind === "take" && result.success) return end("success", `${result.text} Done in ${tally()}`);
       stage("plan");
       const next = plan(robot, task);
-      if (!result.success && next.current?.text === sub.text) tried.set(sub.text, [...(tried.get(sub.text) ?? []), outcome.ok ? result.text : outcome.text]);
+      if (!result.success && next.current?.text === sub.text) {
+        counts[way]++;
+        fails.set(sub.text, counts);
+        tried.set(sub.text, [...failed, outcome.ok ? result.text : outcome.text]);
+      }
       if (JSON.stringify(next.steps) !== JSON.stringify(current.steps)) emit({ type: "plan", plan: next });
       current = next;
     }
@@ -197,7 +205,7 @@ async function run(ctx: Ctx, sub: NonNullable<Plan["current"]>, attempt: number)
 
 // ---- checks: code decides when a step is done ----
 
-// Driving: the base is where the goal asked, still 0.5 s later. Approaching: the destination is in reach.
+// Driving: the base is where the goal asked, still 0.1 s later. Approaching: the destination is in reach.
 async function checkBase(robot: Robot, sub: DriveSub | Approach) {
   if (sub.kind === "approach") {
     const { r, a } = robot.polar(sub.where());
@@ -206,7 +214,7 @@ async function checkBase(robot: Robot, sub: DriveSub | Approach) {
   }
   const togo = toGo(robot, sub.drive);
   if (!driven(robot, sub.drive)) return { success: false, text: `${sub.drive.turn ? `${Math.abs(deg(togo))}°` : `${Math.abs(cm(togo))} cm`} to go.` };
-  await robot.hold(0.5);
+  await robot.hold(0.1);
   return { success: true, text: baseMoved(robot, sub.drive) };
 }
 // How far the base went on the goal's move, in words, and how far it ended beside the straight line.
@@ -218,19 +226,19 @@ function baseMoved(robot: Robot, drive: Drive) {
   return `The base ${drive.turn ? `turned ${Math.abs(deg(done))}° ${done > 0 ? "left" : "right"}` : `moved ${Math.abs(cm(done))} cm ${done > 0 ? "forward" : "back"}`}${beside}.`;
 }
 
-// Taking: the target's lowest point 5 cm up, gripped by both jaws, for 1 s.
+// Taking: the target's lowest point 5 cm up, gripped by both jaws, for 0.3 s.
 async function checkTake(robot: Robot) {
   const name = robot.focus!.label;
   if (!robot.held()) {
     const object = robot.object();
     return { success: false, text: object.bottom > 0.005 ? `${name} ${cm(object.bottom)} cm up, not lifted ${cm(LIFTED)} cm yet.` : `${name} not lifted.` };
   }
-  await robot.hold(1);
+  await robot.hold(0.3);
   const success = robot.held();
-  return { success, text: success ? `${name} lifted ${cm(robot.object().bottom)} cm and held for 1 s.` : `${name} slipped.` };
+  return { success, text: success ? `${name} lifted ${cm(robot.object().bottom)} cm and held for 0.3 s.` : `${name} slipped.` };
 }
 
-// Placing: the object sits on its target, let go, jaws clear, and still there 0.5 s later.
+// Placing: the object sits on its target, let go, jaws clear, and still there 0.3 s later.
 async function checkPlace(robot: Robot, task: Task, sub: Place) {
   const o = sub.object;
   const achieved = () => {
@@ -251,32 +259,32 @@ async function checkPlace(robot: Robot, task: Task, sub: Place) {
           : `${o.label} is not on ${sub.target.label}.`;
     return { success: false, text };
   }
-  await robot.hold(0.5);
+  await robot.hold(0.3);
   if (!achieved() || robot.speed(o) > 0.01) return { success: false, text: `${o.label} did not stay ${sub.target.into ? "in" : "on"} ${sub.target.label}.` };
-  if (sub.target.into) return { success: true, text: `${o.label} is in the container, still after 0.5 s.` };
+  if (sub.target.into) return { success: true, text: `${o.label} is in the container, still after 0.3 s.` };
   const v = versus(robot, o, sub.target);
-  return { success: true, text: `${o.label} sits on ${sub.target.label}, ${cm(v.off)} cm off centre, still after 0.5 s.` };
+  return { success: true, text: `${o.label} sits on ${sub.target.label}, ${cm(v.off)} cm off centre, still after 0.3 s.` };
 }
 // The plan step a subgoal belongs to (the subgoal text names the current top; the step names the tower).
 const stepOf = (task: Task, sub: Place) => (task.kind === "stack" && sub.object !== task.objects[0] ? `Put ${sub.object.label} on the tower` : sub.text);
 
-// The whole task: every step done, still true 1 s later.
+// The whole task: every step done, still true 0.3 s later.
 async function checkAll(robot: Robot, task: Task) {
-  await robot.hold(1);
+  await robot.hold(0.3);
   const now = plan(robot, task);
   if (now.current) return { success: false, text: "Something moved during the last second." };
   if (task.kind === "stack") {
     const top = robot.object(task.objects.at(-1)!).top;
-    return { success: true, text: `${task.objects.length} objects stacked, ${cm(top)} cm tall, standing for 1 s.${task.skipped.length ? " " + task.skipped.join(" ") : ""}` };
+    return { success: true, text: `${task.objects.length} objects stacked, ${cm(top)} cm tall, standing for 0.3 s.${task.skipped.length ? " " + task.skipped.join(" ") : ""}` };
   }
   if (task.kind === "drive") return { success: true, text: baseMoved(robot, task.drive) };
   if (task.kind === "put_in") {
     const n = task.objects.length;
-    return { success: true, text: `${n === 1 ? `${task.objects[0].label} is` : `${n} objects are`} in the container, still for 1 s.${task.skipped.length ? " " + task.skipped.join(" ") : ""}` };
+    return { success: true, text: `${n === 1 ? `${task.objects[0].label} is` : `${n} objects are`} in the container, still for 0.3 s.${task.skipped.length ? " " + task.skipped.join(" ") : ""}` };
   }
   if (task.kind === "drive_to") {
     const { r } = robot.polar(robot.object(task.object).pos);
     return { success: true, text: `${task.object.label} is in reach, ${cm(r)} cm from the arm.` };
   }
-  return { success: true, text: "Done and still for 1 s." };
+  return { success: true, text: "Done and still for 0.3 s." };
 }

@@ -70,8 +70,8 @@ export const BODY = { front: 0.08, back: -0.13, side: 0.095 };
 const WHEEL = 0.03; // wheel radius
 const TRACK = 0.17; // between the left and right wheels
 const SPEED = 0.12; // m/s when driving straight
-const SPIN = 3; // rad/s asked of the chassis when turning; the wheels skid sideways, so it turns slower
-const SETTLE = 0.3; // seconds the wheels hold still after a move
+const SPIN = 4; // rad/s asked of the chassis when turning; the wheels skid sideways, so it turns slower
+const SETTLE = 0.1; // seconds the wheels hold still after a move
 export type Moved = { moved: number; turned: number; bumped: Obj | null };
 // A steered move's speeds for this tick, from the arm frame's pose and the time step: forward m/s and turn
 // rate rad/s, or null once it is there.
@@ -159,7 +159,9 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   const floor = id(obj.mjOBJ_GEOM, "floor");
   let added = 0;
   let dragged: { o: Obj; pose: number[] } | null = null;
-  let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void; until?: () => boolean } | null = null;
+  // A timed arm motion. After the glide it settles until the joints stop, `settle` seconds at most; a hold waits
+  // the whole time.
+  let motion: { path: number[][]; start: number; duration: number; settle: number; hold: boolean; done: () => void; until?: () => boolean } | null = null;
   // A base move: its start pose, how far it has turned so far, and when it stopped (-1 while it runs).
   // `before`: the objects it touched at the start, with where they stood then. A steered move asks `control`
   // for its speeds every tick; `amount` is then its time limit in seconds.
@@ -232,7 +234,7 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     const near = r.stopped >= 0;
     const speed = (cap: number, gain: number, floor: number) => Math.sign(left) * Math.min(cap, gain * Math.abs(left) + (near ? 0 : floor));
     let v = drive ? speed(Math.min(SPEED, 0.4 * t + 0.02), 3, 0.01) : 0;
-    let w = drive ? -8 * r.turned : speed(Math.min(SPIN, 3 * t + 0.2), 6, 0.15);
+    let w = drive ? -8 * r.turned : speed(Math.min(SPIN, 6 * t + 0.2), 12, 0.3);
     if (r.kind === "steer") {
       const asked = near ? null : r.control!(b, model.opt.timestep);
       [v, w] = asked ? [asked[0], SKID * asked[1]] : [0, 0];
@@ -329,7 +331,12 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
         robot.setCtrl(a.map((v, j) => v + (b[j] - v) * (s - i)));
         // Stop where the arm is the moment `until` holds, then settle there.
         if (motion.until?.()) Object.assign(motion, { until: undefined, path: [[...robot.target], [...robot.target]], start: data.time - motion.duration });
-        if (t >= motion.duration + motion.settle) {
+        // Still: every joint slow, and the arm's joints on their targets (the gripper may stall on what it holds).
+        const still =
+          !motion.hold &&
+          t >= motion.duration + 0.03 &&
+          actuators.every(({ dof, qpos }, i) => Math.abs(data.qvel[dof]) < 0.1 && (i === GRIPPER || Math.abs(data.qpos[qpos] - robot.target[i]) < 0.02));
+        if (t >= motion.duration + motion.settle || still) {
           const { done } = motion;
           motion = null;
           done();
@@ -337,15 +344,17 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       }
       mujoco.mj_step(model, data);
     },
-    // Glide the actuator targets through `path` (full 6-joint targets), then hold for `settle` seconds.
-    // Resolves in simulated time, so it works the same live and headless. `until`, checked every step, ends the glide early.
-    play(path: number[][], duration: number, settle = 0.25, until?: () => boolean) {
+    // Glide the actuator targets through `path` (full 6-joint targets), then settle until the joints stop, up to
+    // `settle` seconds. Resolves in simulated time, so it works the same live and headless. `until`, checked every
+    // step, ends the glide early.
+    play(path: number[][], duration: number, settle = 0.25, until?: () => boolean, hold = false) {
       robot.stopArm();
       return new Promise<void>((done) => {
-        motion = { path: [[...robot.target], ...path], start: data.time, duration: Math.max(duration, 1e-3), settle, done, until };
+        motion = { path: [[...robot.target], ...path], start: data.time, duration: Math.max(duration, 1e-3), settle, hold, done, until };
       });
     },
-    hold: (seconds: number) => robot.play([[...robot.target]], 1e-3, seconds),
+    // Keep the arm where it is for `seconds`.
+    hold: (seconds: number) => robot.play([[...robot.target]], 1e-3, seconds, undefined, true),
     stopArm() {
       const done = motion?.done;
       motion = null;

@@ -6,7 +6,7 @@
 // Skills read the scene from the World (world.ts) and act through the robot: joint targets, the gripper and
 // the wheels. Numbers and geometry stay in code.
 import { CLOSED, GRIPPER, LIFTED, OPEN, REST, STEP, TURN, WALL, wrap, type Obj, type Robot, type Vec3 } from "./robot";
-import { clear, inReach, intoTarget, onTop, restingOn, toGo, type Subgoal, type Target } from "./plan";
+import { clear, driven, inReach, intoTarget, onTop, restingOn, toGo, type Subgoal, type Target } from "./plan";
 import { MARGIN, armOf, clearance, floorMap, follow, goalsAround, goalsForMove, nearest, pivot, planPath, type FloorMap } from "./nav";
 import type { World } from "./world";
 
@@ -31,6 +31,9 @@ const LIFT = 0.08;
 const EMPTY = { speed: 0.3, accel: 0.6 };
 const LOADED = { speed: 0.15, accel: 0.2 };
 const TURN_RATE = 1.4; // rad/s turning on the spot
+// Arm moves take this share of the time they took at first: measured, 3 times faster keeps every pick.
+const PACE = 0.35;
+const play = (robot: Robot, path: number[][], seconds: number, settle?: number, until?: () => boolean) => robot.play(path, PACE * seconds, settle, until);
 
 export const cm = (m: number) => Math.round(m * 1000) / 10;
 export const deg = (rad: number) => Math.round((rad * 180) / Math.PI);
@@ -41,13 +44,14 @@ export const deg = (rad: number) => Math.round((rad * 180) / Math.PI);
 export async function openJaws({ robot, stage }: Ctx) {
   stage("physics");
   const held = robot.contacts();
-  await robot.play([[...robot.target.slice(0, GRIPPER), OPEN]], 0.5);
+  await play(robot, [[...robot.target.slice(0, GRIPPER), OPEN]], 0.5);
   return held.fixed && held.moving ? "Jaws open. The object was let go." : "Jaws open.";
 }
 
 // Hover just above the object, fingers down, jaws square to a face that fits between them, through a point
 // high above it so the arm never sweeps through it. `turned`: the jaws a quarter turn from the best angle.
-export async function moveAbove({ robot, stage }: Ctx, turned = false) {
+// `open`: the jaws open on the way.
+export async function moveAbove({ robot, stage }: Ctx, turned = false, open = false) {
   stage("ik");
   const object = robot.object();
   let pose = robot.graspYaw(object.top + HOVER);
@@ -58,13 +62,13 @@ export async function moveAbove({ robot, stage }: Ctx, turned = false) {
   }
   if (pose.miss > 0.003) pose = { ...pose, ...robot.solve(pose.pos, pose.yaw, pose.q, 0.05) };
   const via = robot.solve([pose.pos[0], pose.pos[1], Math.max(0.16, object.top + 0.08)], pose.yaw, pose.q, 0.05);
-  const grip = robot.target[GRIPPER];
+  const grip = open ? OPEN : robot.target[GRIPPER];
   // Open jaws still around an object it just set down rise straight up first, so they do not drag it along.
   const tip = robot.tcp();
   const around = robot.active().filter((o) => o !== robot.focus && !clear(robot, o));
   const rise = around.length ? line(robot, tip, [tip[0], tip[1], Math.max(...around.map((o) => robot.object(o).top)) + 0.04], 0.3, robot.handYaw()) : [];
   stage("physics");
-  await robot.play([...rise, [...via.q, grip], [...pose.q, grip]], rise.length ? 2.4 : 1.8);
+  await play(robot, [...rise, [...via.q, grip], [...pose.q, grip]], rise.length ? 2.4 : 1.8);
   return reached(robot, pose.pos, "Above the object");
 }
 
@@ -78,23 +82,25 @@ export async function lowerToObject({ robot, stage }: Ctx, placing = false) {
   const goal = robot.gripPoint(yaw, z);
   const path = line(robot, robot.tcp(), goal, 0.3);
   stage("physics");
-  await robot.play(path, 1.0);
+  await play(robot, path, 1.0);
   return reached(robot, goal, "Lowered around the object");
 }
 
+// Gentler than the other moves too: jaws that close in under 0.6 s drop a 6 cm wide box 1 time in 8, measured.
 export async function closeJaws({ robot, stage }: Ctx) {
   stage("physics");
-  await robot.play([[...robot.target.slice(0, GRIPPER), CLOSED]], 0.8, 0.4);
+  await robot.play([[...robot.target.slice(0, GRIPPER), CLOSED]], 0.6, 0.4);
   const { fixed, moving } = robot.contacts();
   return fixed && moving ? "Jaws closed on the object." : "Jaws closed on nothing.";
 }
 
+// A gentler pace than the other moves: a wide, flat box held by the jaw tips slips when jerked up.
 export async function lift({ robot, stage }: Ctx) {
   stage("ik");
   const tip = robot.tcp();
   const path = line(robot, tip, [tip[0], tip[1], tip[2] + LIFT], 0.05);
   stage("physics");
-  await robot.play(path, 1.2);
+  await robot.play(path, 0.6);
   return `Raised ${cm(robot.tcp()[2] - tip[2])} cm.`;
 }
 
@@ -118,7 +124,7 @@ export async function carryAbove({ robot, stage }: Ctx, target: Target, turned =
   const over = line(robot, [tip[0], tip[1], safe], [goal[0], goal[1], safe], TILT, yaw0, yaw0 + turn, up.at(-1), true);
   const down = safe - goal[2] > 0.005 ? line(robot, [goal[0], goal[1], safe], goal, TILT, yaw0 + turn, yaw0 + turn, over.at(-1)) : [];
   stage("physics");
-  await robot.play([...up, ...over, ...down], 1.2 + (0.4 * (up.length + down.length)) / 6 + Math.min(1.2, 8 * Math.hypot(goal[0] - tip[0], goal[1] - tip[1])));
+  await play(robot, [...up, ...over, ...down], 1.2 + (0.4 * (up.length + down.length)) / 6 + Math.min(1.2, 8 * Math.hypot(goal[0] - tip[0], goal[1] - tip[1])));
   const a = robot.object();
   const grip = robot.contacts();
   if (!grip.fixed || !grip.moving) return `Dropped ${robot.focus!.label} on the way.`;
@@ -140,14 +146,14 @@ export async function lowerToPlace({ robot, stage }: Ctx, target: Target) {
     return target.object ? t.others.has(target.object) || robot.touching(target.object).arm : t.table;
   };
   stage("physics");
-  await robot.play(path, 1.2, 0.3, landed);
+  await play(robot, path, 1.2, 0.3, landed);
   const v = versus(robot, focus, target);
   return v.sitting ? `Set down on ${target.label}, ${cm(v.off)} cm off centre.` : `Lowered, ${cm(v.gap)} cm above ${target.label}, not on it.`;
 }
 
 export async function releaseJaws({ robot, stage }: Ctx, target: Target) {
   stage("physics");
-  await robot.play([[...robot.target.slice(0, GRIPPER), OPEN]], 0.6, 0.4);
+  await play(robot, [[...robot.target.slice(0, GRIPPER), OPEN]], 0.6, 0.4);
   const o = robot.focus!;
   const on = target.object ? restingOn(robot, o, target.object) : robot.touching(o).table;
   return on ? `Let go. ${o.label} sits on ${target.label}.` : `Let go. ${o.label} is not on ${target.label}.`;
@@ -164,7 +170,7 @@ export async function retreat({ robot, stage }: Ctx) {
   if (robot.focus!.kind === "ball") {
     const up = line(robot, tip, [tip[0], tip[1], Math.max(tip[2], o.top) + 0.03], TILT, yaw);
     stage("physics");
-    await robot.play(up, 1.0);
+    await play(robot, up, 1.0);
     return clear(robot, robot.focus!) ? "Rose straight up, jaws clear." : "Rose, but the jaws are still around the ball.";
   }
   const off: Vec3 = [tip[0] - 0.006 * Math.cos(yaw), tip[1] - 0.006 * Math.sin(yaw), tip[2]];
@@ -176,7 +182,8 @@ export async function retreat({ robot, stage }: Ctx) {
   const slide = line(robot, off, away, TILT, yaw, yaw, back.at(-1));
   const rise = line(robot, away, [away[0], away[1], Math.max(away[2] + 0.02, o.top + 0.02)], TILT, yaw, yaw, slide.at(-1));
   stage("physics");
-  await robot.play([...back, ...slide, ...rise], 1.6);
+  // Slower than the other moves: sliding out fast, a jaw catches the box it just set down and tips the stack.
+  await robot.play([...back, ...slide, ...rise], 0.9);
   return clear(robot, robot.focus!) ? "Moved out, jaws clear." : "Moved out, but the jaws are still around the object.";
 }
 
@@ -186,7 +193,7 @@ async function raise({ robot, stage }: Ctx) {
   const tip = robot.tcp();
   const path = line(robot, tip, [tip[0], tip[1], tip[2] + 0.05], TILT, robot.handYaw());
   stage("physics");
-  await robot.play(path, 0.8);
+  await play(robot, path, 0.8);
 }
 
 // ---- the base ----
@@ -206,7 +213,7 @@ export async function stow({ robot, stage }: Ctx) {
     if (up < 0.005) return;
     const path = line(robot, tip, [tip[0], tip[1], tip[2] + up], TILT, robot.handYaw());
     stage("physics");
-    await robot.play(path, 1.0);
+    await play(robot, path, 1.0);
     return;
   }
   const q = robot.joints();
@@ -214,7 +221,7 @@ export async function stow({ robot, stage }: Ctx) {
   if (folded && q[GRIPPER] > 0.5) return;
   const rise = !folded && tip[2] < tallest + 0.04 ? line(robot, tip, [tip[0], tip[1], tallest + 0.04], TILT, robot.handYaw()) : [];
   stage("physics");
-  await robot.play([...rise, [...REST.slice(0, GRIPPER), OPEN]], folded ? 0.5 : rise.length ? 2.2 : 1.5);
+  await play(robot, [...rise, [...REST.slice(0, GRIPPER), OPEN]], folded ? 0.5 : rise.length ? 2.2 : 1.5);
 }
 
 // The drive pad: one step of 10 cm or 15°.
@@ -280,7 +287,13 @@ export async function goTo(ctx: Ctx, sub: DriveSub | Approach, opts: { avoid?: n
     ctx.path(path.points);
     stage("drive");
     const near = opts.preshape && preshape(ctx, opts.preshape, armOf(path.goal));
-    const r = await follow(robot, path, { ...how, signal, near: near ? { within: 0.15, run: near } : undefined }, map);
+    // Close enough already: the object well in reach, or the move asked for done. Then no last corrections.
+    const enough = () => {
+      if (sub.kind === "drive") return driven(robot, sub.drive);
+      const { r, a } = robot.polar(sub.where());
+      return Math.abs(r - sub.distance) < 0.03 && Math.abs(a) < 0.35;
+    };
+    const r = await follow(robot, path, { ...how, signal, near: near ? { within: 0.15, run: near } : undefined, enough }, map);
     if (r.ok) return { ok: true, text: `${touched.length ? `Planned again after touching ${labels(touched)}. ` : ""}Drove ${cm(r.moved)} cm on a path of ${path.segments.length} ${path.segments.length === 1 ? "move" : "moves"}.` };
     if (signal.aborted) return { ok: false, text: "Stopped." };
     if (!r.bumped) {
@@ -312,7 +325,7 @@ function preshape(ctx: Ctx, o: Obj, goal: { x: number; y: number; yaw: number })
   const yaw = face + q * Math.round((Math.atan2(y, x) - face) / q);
   return () => {
     const pose = robot.solve([x, y, z], yaw, [Math.atan2(y, x), 0, 0, 1.2, 0], 0.05);
-    robot.play([[...pose.q, OPEN]], 1.0, 0);
+    play(robot, [[...pose.q, OPEN]], 1.0, 0);
   };
 }
 
@@ -355,14 +368,16 @@ export async function pick(ctx: Ctx, o: Obj, variant: number, approach?: Approac
     if (!moved.ok) return moved;
     robot.focus = o;
   }
+  // The jaws open on the way above it, unless they hold something to let go of first.
   const steps: [string, () => Promise<string>][] = [
     ["open_gripper", () => openJaws(ctx)],
-    ["move_above_object", () => moveAbove(ctx, variant === 1)],
+    ["move_above_object", () => moveAbove(ctx, variant === 1, true)],
     ["lower_to_object", () => lowerToObject(ctx, false)],
     ["close_gripper", () => closeJaws(ctx)],
   ];
+  const holding = robot.active().some(robot.gripped);
   for (const [name, run] of steps) {
-    if (name === "open_gripper" && robot.joints()[GRIPPER] > 0.6 && !robot.gripped(o)) continue;
+    if (name === "open_gripper" && !holding) continue;
     if (ctx.signal.aborted) return { ok: false, text: "Stopped." };
     const text = await run();
     ctx.say(name, text);
@@ -448,7 +463,7 @@ async function drop(ctx: Ctx, o: Obj, container: Obj): Promise<Outcome> {
     if (/Dropped/.test(text)) return { ok: false, text };
   }
   ctx.stage("physics");
-  await robot.play([[...robot.target.slice(0, GRIPPER), OPEN]], 0.6, 0.4);
+  await play(robot, [[...robot.target.slice(0, GRIPPER), OPEN]], 0.6, 0.4);
   ctx.say("release", robot.inside(o, container) ? `Let go. ${o.label} is in the container.` : `Let go. ${o.label} is not in the container.`);
   await raise(ctx);
   ctx.say("retreat", "Rose straight up.");
@@ -488,12 +503,13 @@ async function pickToPlace(ctx: Ctx, o: Obj, variant: number, approach?: Approac
   }
   const steps: [string, () => Promise<string>][] = [
     ["open_gripper", () => openJaws(ctx)],
-    ["move_above_object", () => moveAbove(ctx, variant === 1 && o.kind === "box")],
+    ["move_above_object", () => moveAbove(ctx, variant === 1 && o.kind === "box", true)],
     ["lower_to_object", () => lowerToObject(ctx, low)],
     ["close_gripper", () => closeJaws(ctx)],
   ];
+  const holding = robot.active().some(robot.gripped);
   for (const [name, run] of steps) {
-    if (name === "open_gripper" && robot.joints()[GRIPPER] > 0.6) continue;
+    if (name === "open_gripper" && !holding) continue;
     if (ctx.signal.aborted) return { ok: false, text: "Stopped." };
     const text = await run();
     ctx.say(name, text);

@@ -493,8 +493,8 @@ export const TARGETS = {
   wrongObject: 100, // % clean
   container: 90, // % success
 };
-// The floor each phase ships on: raised as the phases land.
-export const GATE = { clean: 95, wrongObject: 100, noBaseTouch: 98, maxTilt: 5, callsMedian: 1, callsP90: 2, container: 90 };
+// The floor each phase ships on, raised as the phases landed: now the targets themselves.
+export const GATE: { [k: string]: number } = TARGETS;
 
 export function gate(s: Summary, floor: { [k: string]: number } = GATE) {
   const fails: string[] = [];

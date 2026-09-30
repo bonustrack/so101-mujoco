@@ -363,6 +363,8 @@ export type Drive = {
   signal?: AbortSignal;
   // Called once when the last part of the path has `within` metres left: the arm gets ready meanwhile.
   near?: { within: number; run: () => void };
+  // True when where the path ended is good enough: then no last corrections.
+  enough?: () => boolean;
 };
 // Turns up to this size between two straight parts are smoothed into a curve; bigger ones are made on the spot.
 const SMOOTH = 0.61;
@@ -417,6 +419,7 @@ export async function follow(robot: Robot, path: Path, drive: Drive, map?: Floor
     if (!r.ok) return { ...r, moved };
   }
   near?.run();
+  if (drive.enough?.()) return { ok: true, bumped: null, moved };
   // The last few cm: along its heading, then the goal's heading, each only where it keeps 1 cm clear.
   const c = pivot(robot.base());
   const along = (path.goal.x - c.x) * Math.cos(c.yaw) + (path.goal.y - c.y) * Math.sin(c.yaw);

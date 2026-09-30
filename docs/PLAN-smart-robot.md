@@ -1,6 +1,6 @@
 # Plan: a smarter, faster SO-101 on wheels
 
-Status: research 2026-09-30 on top of 36c6988, now built phase by phase (see the commits).
+Status: built, all phases (2026-09-30). Results in section 6.
 
 ## 1. What goes wrong today
 
@@ -160,3 +160,27 @@ bun scripts/bench.ts --mode jev --runs 48 --seed 1500 --out /tmp/so101-bench/jev
 ```
 
 Times are simulated motion time plus the measured Jev latency. The page runs the physics in real time, so this matches what the page shows, plus the browser.
+
+## 6. Results
+
+`bun run bench`, the rules decider, 20 random scenes per family. 12 families (240 runs) until phase 2, 14 with the two container families from phase 3 (280 runs). Times are motion plus 0.2 s per Jev call.
+
+| | Before (36c6988) | Phase 0 | Phase 1 | Phase 2 | Phase 3 | Phase 4 | Target |
+|---|---|---|---|---|---|---|---|
+| Clean success | 62% | 70% | 98% | 98% | 100% | 100% | 95% or more |
+| Task time, median / p90 | 16.4 / 44.3 s | 16.4 / 44.3 s | 15.0 / 43.7 s | 12.7 / 48.9 s | 14.1 / 60.8 s | 6.5 / 31.6 s | 7 s or less |
+| Jev calls, median / p90 / max | 8 / 23 / 84 | 8 / 23 / 84 | 6 / 15 / 23 | 1 / 1 / 3 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 2 |
+| Runs without base contact | 71% | 71% | 100% | 100% | 100% | 99.6% | 98% or more |
+| Max chassis tilt | 15.3° | 15.3° | 1.2° | 0.9° | 1.2° | 1.4° | under 5° |
+| "Take the ball", a box selected | 0% | 100% | 100% | 100% | 100% | 100% | 100% |
+| Container tasks | | | | | 100% | 100% | 90% or more |
+
+Phase 4 by family, median time: take in reach 2.9 s, turn around 3.7 s, go forward 50 cm around a box 4.7 s, drive to an object 4.8 s, put on a box in reach 4.9 s, far take 7.2 s, blocked take 8.0 s, stack 3 in reach 10.5 s, far put 13.8 s, put in the container 14.5 s, stack 3 spread out 30.7 s, fill the container with 3 balls 48.5 s.
+
+Real Jev (`jev-latest`) on the same bench after phase 4: 28 runs, 2 per family, 100% clean, median 6.0 s, 1 call per task.
+
+Not done as planned:
+- Timestep 0.01: CPU per run went from 1.7 to 1.2 s only, and the base got worse (a base contact, tilt 3°, median 7.7 s). The model keeps 0.005.
+- The pivot: the base turns about a point 2.5 cm ahead of the arm's base, not its chassis centre (the arm loads the front wheels). The planner uses the measured point.
+- Pose noise in the bench (5 mm, 5°) is not built: the skills still read true poses.
+

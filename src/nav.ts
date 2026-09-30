@@ -97,7 +97,7 @@ const cornersOf = (r: Rect) =>
   ].map(([i, j]) => [r.x + i * r.hx * Math.cos(r.yaw) - j * r.hy * Math.sin(r.yaw), r.y + i * r.hx * Math.sin(r.yaw) + j * r.hy * Math.cos(r.yaw)]);
 // The gap between two rectangles: negative, by how deep, when they overlap (separating axes), else the nearest
 // corner of one to the other.
-function rectGap(a: Rect, b: Rect) {
+export function rectGap(a: Rect, b: Rect) {
   const ca = cornersOf(a);
   const cb = cornersOf(b);
   let overlap = Infinity;
@@ -410,6 +410,7 @@ export async function follow(robot: Robot, path: Path, drive: Drive, map?: Floor
       const d = leg.amount + wrap(leg.yaw - leg.amount - robot.base().yaw);
       if (Math.abs(d) < 0.01) continue;
       const r = await robot.move("turn", d);
+      if (drive.signal?.aborted) return { ok: false, bumped: null, moved };
       if (r.bumped) return { ok: false, bumped: r.bumped, moved };
       continue;
     }
@@ -418,6 +419,7 @@ export async function follow(robot: Robot, path: Path, drive: Drive, map?: Floor
     moved += r.moved;
     if (!r.ok) return { ...r, moved };
   }
+  if (drive.signal?.aborted) return { ok: false, bumped: null, moved };
   near?.run();
   if (drive.enough?.()) return { ok: true, bumped: null, moved };
   // The last few cm: along its heading, then the goal's heading, each only where it keeps 1 cm clear.
@@ -426,6 +428,7 @@ export async function follow(robot: Robot, path: Path, drive: Drive, map?: Floor
   const room = (p: Pose) => !map || clearance(map, p) >= 0.01;
   if (Math.abs(along) > 0.004 && room({ x: c.x + along * Math.cos(c.yaw), y: c.y + along * Math.sin(c.yaw), yaw: c.yaw })) {
     const r = await robot.move("drive", along);
+    if (drive.signal?.aborted) return { ok: false, bumped: null, moved };
     moved += Math.abs(r.moved);
     if (r.bumped) return { ok: false, bumped: r.bumped, moved };
   }
@@ -433,6 +436,7 @@ export async function follow(robot: Robot, path: Path, drive: Drive, map?: Floor
   const e = pivot(robot.base());
   if (Math.abs(d) > 0.01 && [0.5, 1].every((k) => room({ ...e, yaw: e.yaw + k * d }))) {
     const r = await robot.move("turn", d);
+    if (drive.signal?.aborted) return { ok: false, bumped: null, moved };
     if (r.bumped) return { ok: false, bumped: r.bumped, moved };
   }
   return { ok: true, bumped: null, moved };
@@ -506,6 +510,7 @@ async function pursue(robot: Robot, leg: Extract<Leg, { kind: "run" }>, drive: D
     return [leg.back ? -v : v, w];
   };
   const r = await robot.steer(control, 3 + (3 * total) / drive.speed);
+  if (drive.signal?.aborted) return { ok: false, bumped: null, moved: travelled };
   if (r.bumped) return { ok: false, bumped: r.bumped, moved: travelled };
   if (stuck) return { ok: false, bumped: null, moved: travelled, text: "no progress for 2 s" };
   const end = pts.at(-1)!;

@@ -41,7 +41,7 @@ export type AgentEvent =
 export const budget = (task: Task) => 60 + 20 * Math.max(1, taskSize(task));
 // The ways each skill is tried, in order, once each.
 export const HOW: Record<Skill, string[]> = {
-  drive: ["the shortest free path", "backing off 10 cm first", "the shortest free path again"],
+  drive: ["the shortest free path", "backing off 10 cm first"],
   pick: ["the best jaw angle", "the jaws turned 90°", "from another side"],
   place: ["as planned", "landing a quarter turn around", "from another side"],
 };
@@ -70,7 +70,11 @@ export async function runAgent(options: {
   onEvent: (event: AgentEvent) => void;
   selected?: Obj | null; // the object selected in the scene, if any
 }) {
-  const { robot, goal, model, decide, signal, onEvent: emit, selected = null } = options;
+  const { robot, goal, model, decide, onEvent: emit, selected = null } = options;
+  const timeout = new AbortController();
+  const signal = AbortSignal.any([options.signal, timeout.signal]);
+  const cancel = () => robot.cancel();
+  signal.addEventListener("abort", cancel, { once: true });
   const stage = (s: Stage) => emit({ type: "stage", stage: s });
   const ctx: Ctx = {
     robot,
@@ -84,6 +88,7 @@ export async function runAgent(options: {
   let calls = 0;
   let steps = 0;
   const end = (outcome: Extract<AgentEvent, { type: "end" }>["outcome"], text: string) => emit({ type: "end", outcome, text });
+  const stopped = () => timeout.signal.aborted ? end("budget", "Out of time: the task's motion budget was reached.") : end("stopped", "Stop pressed.");
   const ask = async (request: JevRequest) => {
     const started = performance.now();
     const response = await decide(request, signal);
@@ -112,17 +117,18 @@ export async function runAgent(options: {
     let current = plan(robot, task);
     emit({ type: "plan", plan: current });
     const started = robot.data.time;
+    robot.limit = { time: started + seconds, stop: () => timeout.abort() };
     // Per step: failed tries per way, how each failed try ended, and how many tries each way gets (1, then 2
     // once Jev says retry). So no way runs more than twice.
     const fails = new Map<string, number[]>();
     const tried = new Map<string, string[]>();
     const rounds = new Map<string, number>();
     for (;;) {
-      if (signal.aborted) return end("stopped", "Stop pressed.");
+      if (signal.aborted) return stopped();
       if (!current.current) {
         stage("check");
         const all = await checkAll(robot, task);
-        if (signal.aborted) return end("stopped", "Stop pressed.");
+        if (signal.aborted) return stopped();
         if (all.success) return end("success", `${steps ? "" : "Already done. "}${all.text} Done in ${tally()}`);
         emit({ type: "check", ...all });
         current = plan(robot, task);
@@ -165,12 +171,12 @@ export async function runAgent(options: {
       robot.focus = sub.kind === "drive" ? null : sub.object;
       emit({ type: "skill", step: steps, skill, subgoal: sub.text, attempt: failed.length + 1, how: HOW[skill][way] });
       const outcome = await run(ctx, sub, way);
-      if (signal.aborted) return end("stopped", "Stop pressed.");
+      if (signal.aborted) return stopped();
 
       // 4. Check the step, then plan again from what the physics shows now.
       stage("check");
       const result = sub.kind === "take" ? await checkTake(robot) : sub.kind === "place" ? await checkPlace(robot, task, sub) : await checkBase(robot, sub);
-      if (signal.aborted) return end("stopped", "Stop pressed.");
+      if (signal.aborted) return stopped();
       emit({ type: "check", ...result });
       if (sub.kind === "take" && result.success) return end("success", `${result.text} Done in ${tally()}`);
       stage("plan");
@@ -184,8 +190,11 @@ export async function runAgent(options: {
       current = next;
     }
   } catch (error) {
-    if (signal.aborted) return end("stopped", "Stop pressed.");
+    if (signal.aborted) return stopped();
     end("error", error instanceof Error ? error.message : String(error));
+  } finally {
+    robot.limit = null;
+    signal.removeEventListener("abort", cancel);
   }
 }
 const left = (p: Plan) => p.steps.filter((s) => !s.done).map((s) => s.text).join(", ");
@@ -194,7 +203,7 @@ const left = (p: Plan) => p.steps.filter((s) => !s.done).map((s) => s.text).join
 async function run(ctx: Ctx, sub: NonNullable<Plan["current"]>, attempt: number) {
   const { robot } = ctx;
   if (sub.kind === "drive" || sub.kind === "approach") {
-    const next = sub.kind === "approach" && !robot.gripped(sub.object) ? sub.object : undefined;
+    const next = sub.kind === "approach" && !robot.active().some(robot.gripped) ? sub.object : undefined;
     const r = await goTo(ctx, sub, { backOff: attempt === 1, preshape: next });
     ctx.say(sub.kind === "drive" ? "drive" : "drive_to_object", r.text);
     return r;

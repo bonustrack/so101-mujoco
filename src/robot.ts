@@ -195,11 +195,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   const bumping = () => {
     const touched = new Set<Obj>();
     const gripped = new Map<Obj, number>();
+    const pairs: [Obj, Obj][] = [];
     const contacts = data.contact;
     for (let i = 0; i < data.ncon; i++) {
       const c = contacts.get(i);
       if (!c) continue;
       const [a, b] = [byGeom.get(c.geom1), byGeom.get(c.geom2)];
+      if (a && b && a.active && b.active) pairs.push([a, b]);
       const o = a ?? b;
       const other = a ? c.geom2 : c.geom1;
       if (o && o.active && armGeoms.includes(other)) {
@@ -211,7 +213,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       c.delete();
     }
     contacts.delete();
-    for (const [o, jaws] of gripped) if (jaws === 3) touched.delete(o);
+    for (const [o, jaws] of gripped) if (jaws === 3) {
+      touched.delete(o);
+      for (const [a, b] of pairs) {
+        if (a === o) touched.add(b);
+        if (b === o) touched.add(a);
+      }
+    }
     return touched;
   };
   // How far the current base move has gone: along its start heading, and turned.
@@ -250,6 +258,9 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
         if (hit) {
           r.bumped = hit;
           r.stopped = data.time;
+          robot.stopArm();
+          robot.setCtrl(robot.joints());
+          park();
           v = w = 0;
         }
       }
@@ -305,6 +316,7 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     // The object the pick commands, the observation and the success check work on.
     focus: null as Obj | null,
     target: [...REST],
+    limit: null as { time: number; stop: () => void } | null,
     setCtrl(values: number[]) {
       values.forEach((v, i) => {
         robot.target[i] = Math.min(Math.max(v, range[i][0]), range[i][1]);
@@ -316,6 +328,11 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     // One physics step. Unused and dragged objects are held in place; a running motion sets the actuator targets,
     // a running base move the wheel speeds.
     step() {
+      if (robot.limit && data.time >= robot.limit.time) {
+        const { stop } = robot.limit;
+        robot.limit = null;
+        stop();
+      }
       for (const o of objects) if (!o.active) pin(o, PARKED);
       if (dragged) pin(dragged.o, dragged.pose);
       ticks++;
@@ -369,6 +386,7 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     // Stop everything: the arm where it is, the wheels at once.
     cancel() {
       robot.stopArm();
+      robot.setCtrl(robot.joints());
       robot.stopBase();
     },
 
@@ -584,13 +602,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       let arm = false;
       let table = false;
       const others = new Set<Obj>();
-      const geom = o?.geom ?? -1;
+      const geoms = o?.geoms ?? [];
       // data.contact is a fresh copy of every contact on each read: read it once and free it.
       const contacts = data.contact;
       for (let i = 0; i < data.ncon; i++) {
         const c = contacts.get(i);
         if (!c) continue;
-        const other = c.geom1 === geom ? c.geom2 : c.geom2 === geom ? c.geom1 : -1;
+        const other = geoms.includes(c.geom1) ? c.geom2 : geoms.includes(c.geom2) ? c.geom1 : -1;
         if (other >= 0) {
           const body = model.geom_bodyid[other];
           if (body === hand) fixed = true;

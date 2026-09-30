@@ -367,14 +367,12 @@ export const onTop = (robot: Robot, o: Obj): Target => {
   return { label: o.label, x: pos[0], y: pos[1], top, yaw: o.kind === "box" ? yaw : null, object: o };
 };
 
-// Driving up to an object, to take it: it ends 20 cm straight ahead of the arm. The container's centre ends 24 cm
-// ahead, clear of the chassis.
 const approachObject = (robot: Robot, o: Obj): Subgoal => ({
   kind: "approach",
   object: o,
   label: o.label === "Container" ? "the container" : o.label,
   where: () => robot.object(o).pos.slice(0, 2) as [number, number],
-  distance: o.kind === "container" ? 0.24 : PICK,
+  distance: o.kind === "container" ? 0.25 : PICK,
   text: `Drive to ${o.label === "Container" ? "the container" : o.label}`,
 });
 // Driving up to where a held object goes: a tower's top ends where the arm reaches highest.
@@ -383,7 +381,7 @@ const approachTarget = (robot: Robot, o: Obj, target: Target, spot?: { x: number
   object: o,
   label: target.into ? target.label : target.object ? `the top of ${target.label}` : target.label,
   where: () => (target.object ? robot.object(target.object).pos.slice(0, 2) : robot.toArm([spot!.x, spot!.y, 0]).slice(0, 2)) as [number, number],
-  distance: target.into ? BEST : target.top > 0.05 ? BEST : PICK,
+  distance: target.into ? 0.25 : target.top > 0.05 ? BEST : PICK,
   text: `Carry ${o.label} to ${target.object ? target.label : "the spot"}`,
 });
 // Driving up to an object, or to where the held object goes, from wherever the base stands: a skill's try from

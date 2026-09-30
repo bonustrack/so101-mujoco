@@ -491,8 +491,8 @@ pre {
 
 /* Flow: the loop diagram lights up the live stage; the log scrolls on its own and takes the room left. */
 section.flow:not(.closed) {
-  flex: 1 1 0;
-  min-height: 240px;
+  flex: 1 0 auto;
+  min-height: 300px;
   display: flex;
   flex-direction: column;
 }
@@ -557,7 +557,7 @@ section.flow > * {
 
 #flow {
   flex: 1 1 0;
-  min-height: 0;
+  min-height: 100px;
   overflow-y: auto;
   margin: 8px 0 0;
   padding: 0;
@@ -637,6 +637,8 @@ section.flow > * {
 }
 
 #plan ol {
+  max-height: 6lh;
+  overflow-y: auto;
   margin: 4px 0 0;
   padding: 0;
   list-style: none;

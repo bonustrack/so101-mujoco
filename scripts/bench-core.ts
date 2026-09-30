@@ -29,7 +29,7 @@ export function createBench(robot: Robot) {
   const bodyId = (name: string) => mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY.value, name);
   const chassis = bodyId("chassis");
   const baseBodies = new Set([chassis, ...["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"].map(bodyId)]);
-  const objectGeoms = new Map(robot.objects.map((o) => [o.geom, o]));
+  const objectGeoms = new Map(robot.objects.flatMap((o) => o.geoms.map((g) => [g, o] as const)));
   const floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM.value, "floor");
   const geomKind = (g: number) => (objectGeoms.has(g) ? "object" : g === floor ? "floor" : baseBodies.has(model.geom_bodyid[g]) ? "base" : "arm");
   const EQUALITY = mujoco.mjtDisableBit.mjDSBL_EQUALITY.value;
@@ -188,6 +188,12 @@ export function createBench(robot: Robot) {
       for (const k of ["ball", "ball", "ball", "box"] as const) specs.push(spot(k, specs, [0.25, 0.75], [-Math.PI, Math.PI]));
       const objs = build(specs);
       return { family: "container_fill", goal: pick(["fill the container with the balls", "put all the balls in the container"]), truth: { task: "fill", picks: { which: "balls" } }, objs, moves: objs.filter((o) => o.kind === "ball") };
+    },
+    container_fill_boxes() {
+      const specs: Spec[] = [spot("container", [], [0.4, 0.65], [-Math.PI, Math.PI])];
+      for (const k of ["box", "box", "box", "ball"] as const) specs.push(spot(k, specs, [0.25, 0.75], [-Math.PI, Math.PI]));
+      const objs = build(specs);
+      return { family: "container_fill_boxes", goal: "fill the container with the boxes", truth: { task: "fill", picks: { which: "boxes" } }, objs, moves: objs.filter((o) => o.kind === "box") };
     },
   };
   const families = Object.keys(FAMILY);
@@ -373,6 +379,7 @@ export function createBench(robot: Robot) {
       calls: r.calls,
       inputTokens: r.inputTokens,
       simSeconds: round(r.sim),
+      budgetSeconds: taskEv?.budget ?? 0,
       jevSeconds: round(jevSeconds),
       // What the page shows: motion in real time, plus Jev.
       taskSeconds: round(r.sim + (r.mode === "rules" ? RULES_LATENCY * r.calls : jevSeconds)),
@@ -393,9 +400,9 @@ export function createBench(robot: Robot) {
 export function seedFor(families: string[], i: number, seed0: number) {
   const f = families[i % families.length];
   const k = Math.floor(i / families.length);
-  const all = ["near_take_ball", "near_take_ball_selected", "near_take_named", "near_stack", "near_put", "far_take", "blocked_take", "far_put", "spread_stack", "turn_clutter", "forward_blocked", "drive_to", "container_put", "container_fill"];
+  const all = ["near_take_ball", "near_take_ball_selected", "near_take_named", "near_stack", "near_put", "far_take", "blocked_take", "far_put", "spread_stack", "turn_clutter", "forward_blocked", "drive_to", "container_put", "container_fill", "container_fill_boxes"];
   const at = all.indexOf(f);
-  return { family: f, seed: at < 12 ? seed0 + k * 12 + at : seed0 + 5000 + k * 2 + (at - 12) };
+  return { family: f, seed: at < 12 ? seed0 + k * 12 + at : at < 14 ? seed0 + 5000 + k * 2 + (at - 12) : seed0 + 9000 + k };
 }
 
 const round = (x: number) => Math.round(x * 10) / 10;
@@ -460,8 +467,16 @@ export function summarize(records: Record[]) {
   }));
   const n = records.length;
   const container = records.filter((r) => r.family.startsWith("container"));
+  const safety = families.filter((f) => ["near_take_ball_selected", "blocked_take", "forward_blocked", "turn_clutter"].includes(f.family));
   return {
     runs: n,
+    successCount: records.filter((r) => r.success).length,
+    cleanCount: records.filter((r) => r.clean).length,
+    budgetOverruns: records.filter((r) => r.simSeconds > r.budgetSeconds + 0.1).length,
+    safetyClean: safety.length === 4 ? Math.min(...safety.map((f) => f.clean)) : NaN,
+    nearTakeTime: Math.max(...families.filter((f) => f.family.startsWith("near_take")).map((f) => f.time)),
+    farTakeTime: families.find((f) => f.family === "far_take")?.time ?? NaN,
+    nearStackTime: families.find((f) => f.family === "near_stack")?.time ?? NaN,
     success: pct(records.filter((r) => r.success).length, n),
     clean: pct(records.filter((r) => r.clean).length, n),
     timeMedian: median(records.map((r) => r.taskSeconds)),
@@ -492,42 +507,56 @@ export const TARGETS = {
   maxTilt: 5, // degrees, every run
   wrongObject: 100, // % clean
   container: 90, // % success
+  safetyClean: 100,
+  maxRepeats: 2,
+  budgetOverruns: 0,
+  nearTakeTime: 4,
+  farTakeTime: 9,
+  nearStackTime: 15,
 };
 // The floor each phase ships on, raised as the phases landed: now the targets themselves.
 export const GATE: { [k: string]: number } = TARGETS;
 
 export function gate(s: Summary, floor: { [k: string]: number } = GATE) {
   const fails: string[] = [];
-  if (floor.clean !== undefined && !(s.clean >= floor.clean)) fails.push(`clean ${s.clean.toFixed(0)}% under ${floor.clean}%`);
-  if (floor.wrongObject !== undefined && !(s.wrongObject >= floor.wrongObject)) fails.push(`wrong-object family ${s.wrongObject.toFixed(0)}% clean, under ${floor.wrongObject}%`);
+  if (floor.clean !== undefined && !(s.clean >= floor.clean)) fails.push(`clean ${s.clean.toFixed(1)}% under ${floor.clean}%`);
+  if (floor.wrongObject !== undefined && !(s.wrongObject >= floor.wrongObject)) fails.push(`wrong-object family ${s.wrongObject.toFixed(1)}% clean, under ${floor.wrongObject}%`);
   if (floor.timeMedian !== undefined && !(s.timeMedian <= floor.timeMedian)) fails.push(`median task ${s.timeMedian} s over ${floor.timeMedian} s`);
   if (floor.callsMedian !== undefined && !(s.callsMedian <= floor.callsMedian)) fails.push(`median Jev calls ${s.callsMedian} over ${floor.callsMedian}`);
   if (floor.callsP90 !== undefined && !(s.callsP90 <= floor.callsP90)) fails.push(`p90 Jev calls ${s.callsP90} over ${floor.callsP90}`);
-  if (floor.noBaseTouch !== undefined && !(s.noBaseTouch >= floor.noBaseTouch)) fails.push(`runs without base contact ${s.noBaseTouch.toFixed(0)}% under ${floor.noBaseTouch}%`);
+  if (floor.noBaseTouch !== undefined && !(s.noBaseTouch >= floor.noBaseTouch)) fails.push(`runs without base contact ${s.noBaseTouch.toFixed(1)}% under ${floor.noBaseTouch}%`);
   if (floor.maxTilt !== undefined && !(s.maxTilt < floor.maxTilt)) fails.push(`chassis tilt ${s.maxTilt}° not under ${floor.maxTilt}°`);
-  if (floor.container !== undefined && !(s.container >= floor.container)) fails.push(`container tasks ${s.container.toFixed(0)}% under ${floor.container}%`);
+  if (floor.container !== undefined && !(s.container >= floor.container)) fails.push(`container tasks ${s.container.toFixed(1)}% under ${floor.container}%`);
+  if (floor.safetyClean !== undefined && !(s.safetyClean >= floor.safetyClean)) fails.push(`mandatory safety families ${s.safetyClean.toFixed(1)}% clean, under ${floor.safetyClean}%`);
+  if (floor.maxRepeats !== undefined && !(s.maxRepeats <= floor.maxRepeats)) fails.push(`same settings repeated ${s.maxRepeats} times, over ${floor.maxRepeats}`);
+  if (floor.budgetOverruns !== undefined && !(s.budgetOverruns <= floor.budgetOverruns)) fails.push(`${s.budgetOverruns} tasks exceeded their motion budget`);
+  for (const key of ["nearTakeTime", "farTakeTime", "nearStackTime"] as const)
+    if (floor[key] !== undefined && !(s[key] <= floor[key])) fails.push(`${key} median ${s[key]} s over ${floor[key]} s`);
   return fails;
 }
 
 export function report(s: Summary) {
-  const f = (x: number, d = 0) => (Number.isNaN(x) ? "-" : x.toFixed(d));
+  const f = (x: number, d = 1) => (Number.isFinite(x) ? x.toFixed(d) : "-");
   const lines = [`${"family".padEnd(24)} ${"runs".padStart(4)} ${"ok%".padStart(5)} ${"clean%".padStart(6)} ${"time s".padStart(6)} ${"calls".padStart(5)} ${"touch%".padStart(6)}`];
   for (const r of [...s.families].sort((a, b) => a.family.localeCompare(b.family)))
-    lines.push(`${r.family.padEnd(24)} ${String(r.runs).padStart(4)} ${f(r.success).padStart(5)} ${f(r.clean).padStart(6)} ${f(r.time, 1).padStart(6)} ${f(r.calls).padStart(5)} ${f(r.baseTouch).padStart(6)}`);
+    lines.push(`${r.family.padEnd(24)} ${String(r.runs).padStart(4)} ${f(r.success).padStart(5)} ${f(r.clean).padStart(6)} ${f(r.time, 1).padStart(6)} ${f(r.calls, 0).padStart(5)} ${f(r.baseTouch).padStart(6)}`);
   const t = TARGETS;
   const row = (label: string, value: string, target: string) => `${label.padEnd(34)} ${value.padEnd(14)} target ${target}`;
   lines.push(
     "",
     row("runs", String(s.runs), ""),
-    row("success", `${f(s.success)}%`, ""),
-    row("clean success", `${f(s.clean)}%`, `>= ${t.clean}%`),
+    row("success", `${s.successCount}/${s.runs} (${f(s.success)}%)`, ""),
+    row("clean success", `${s.cleanCount}/${s.runs} (${f(s.clean)}%)`, `>= ${t.clean}%`),
     row("task time median / p90", `${f(s.timeMedian, 1)} / ${f(s.timeP90, 1)} s`, `median <= ${t.timeMedian} s`),
-    row("Jev calls median / p90 / max", `${f(s.callsMedian)} / ${f(s.callsP90)} / ${f(s.callsMax)}`, `${t.callsMedian} / ${t.callsP90}`),
+    row("Jev calls median / p90 / max", `${f(s.callsMedian, 0)} / ${f(s.callsP90, 0)} / ${f(s.callsMax, 0)}`, `${t.callsMedian} / ${t.callsP90}`),
     row("runs without base contact", `${f(s.noBaseTouch)}%`, `>= ${t.noBaseTouch}%`),
     row("max chassis tilt (runs at 5° or more)", `${f(s.maxTilt, 1)}° (${s.tiltOver5})`, `< ${t.maxTilt}°`),
     row("wrong-object family, clean", `${f(s.wrongObject)}%`, `${t.wrongObject}%`),
     row("container tasks, success (clean)", `${f(s.container)}% (${f(s.containerClean)}%)`, `>= ${t.container}%`),
+    row("mandatory safety families, clean", `${f(s.safetyClean)}%`, "100%"),
     row("most repeats of one command", String(s.maxRepeats), "<= 2"),
+    row("tasks over their motion budget", String(s.budgetOverruns), "0"),
+    row("near take / far take / near stack", `${f(s.nearTakeTime)} / ${f(s.farTakeTime)} / ${f(s.nearStackTime)} s`, "4 / 9 / 15 s"),
     row("CPU per run", `${f(s.cpuPerRun, 1)} s`, ""),
   );
   return lines.join("\n");

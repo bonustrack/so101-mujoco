@@ -1,6 +1,6 @@
 # Plan: a smarter, faster SO-101 on wheels
 
-Status: built, all phases (2026-09-30). Results in section 6.
+Status: all phases built, safety follow-up passes both 300-scene release checks (2026-09-30). Exact results and remaining limits are in section 6.
 
 ## 1. What goes wrong today
 
@@ -155,11 +155,14 @@ On the bench (240 runs or more, the real pipeline):
 ## 5. Reproduce
 
 ```sh
-bun scripts/bench.ts --mode oracle --runs 84 --seed 1000 --out /tmp/so101-bench/oracle-1.jsonl
-bun scripts/bench.ts --mode jev --runs 48 --seed 1500 --out /tmp/so101-bench/jev-1.jsonl   # reads the key from ~/.secrets/jev-key
+bun run bench --mode rules --seeds 20 --jobs 2 --seed 1000 --out /tmp/so101-bench/rules-1.jsonl
+bun run bench --mode rules --seeds 20 --jobs 2 --seed 8000 --out /tmp/so101-bench/heldout-1.jsonl
+bun run bench --mode jev --seeds 2 --jobs 2 --seed 1500 --no-gate --out /tmp/so101-bench/jev-1.jsonl
 ```
 
-Times are simulated motion time plus the measured Jev latency. The page runs the physics in real time, so this matches what the page shows, plus the browser.
+The rules benchmark now covers 15 families, including filling the container with boxes: 300 runs at 20 seeds per family. The small real Jev sample checks the provider and goal readings, not the full release gate. It reads the key from `~/.secrets/jev-key` without printing it.
+
+Times are simulated motion time plus Jev latency (0.2 s per call for rules, measured for real Jev). Browser wall time also depends on rendering speed. Software rendering on this box is much slower than real time.
 
 ## 6. Results
 
@@ -167,7 +170,7 @@ Times are simulated motion time plus the measured Jev latency. The page runs the
 
 | | Before (36c6988) | Phase 0 | Phase 1 | Phase 2 | Phase 3 | Phase 4 | Target |
 |---|---|---|---|---|---|---|---|
-| Clean success | 62% | 70% | 98% | 98% | 100% | 100% | 95% or more |
+| Clean success | 62% | 70% | 98% | 98% | 100% | 279/280 (99.6%) | 95% or more |
 | Task time, median / p90 | 16.4 / 44.3 s | 16.4 / 44.3 s | 15.0 / 43.7 s | 12.7 / 48.9 s | 14.1 / 60.8 s | 6.5 / 31.6 s | 7 s or less |
 | Jev calls, median / p90 / max | 8 / 23 / 84 | 8 / 23 / 84 | 6 / 15 / 23 | 1 / 1 / 3 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 2 |
 | Runs without base contact | 71% | 71% | 100% | 100% | 100% | 99.6% | 98% or more |
@@ -179,8 +182,39 @@ Phase 4 by family, median time: take in reach 2.9 s, turn around 3.7 s, go forwa
 
 Real Jev (`jev-latest`) on the same bench after phase 4: 28 runs, 2 per family, 100% clean, median 6.0 s, 1 call per task.
 
+The original phase 4 report rounded 279/280 clean runs to 100%. The table now gives the exact count. Those earlier measurements did not map every container wall in the contact checks. The safety follow-up covers all wall geoms, stops arm motion on driving contact, preserves held loads during GoTo, checks Stop between phases and enforces the deadline during physics steps. The gate now checks all mandatory families, repeat limits and motion budgets. Box filling has its own family, without changing the earlier families' seeds.
+
+### Safety follow-up, 2026-09-30
+
+Both release checks pass with the original targets unchanged. Container approach keeps 25 cm from its centre. Empty-arm driving reuses its hover pose instead of repeating the same move. Gentle grasp, carry and release timings keep the safer arm pace.
+
+| | Default, seed 1000 | Heldout, seed 8000 | Target |
+|---|---|---|---|
+| Success | 299/300 (99.7%) | 300/300 (100%) | |
+| Clean success | 290/300 (96.7%) | 296/300 (98.7%) | at least 95% |
+| Task time, median / p90 | 7.0 / 46.1 s | 6.9 / 42.2 s | median at most 7 s |
+| Jev calls, median / p90 / max | 1 / 1 / 3 | 1 / 1 / 2 | median 1, p90 at most 2 |
+| Runs without base contact | 300/300 (100%) | 295/300 (98.3%) | at least 98% |
+| Mandatory safety families, clean | 80/80 (100%) | 80/80 (100%) | 100% |
+| Most repeats of the same settings | 2 | 2 | at most 2 |
+| Motion-budget overruns | 0 | 0 | 0 |
+| Near take / far take / near 3-box stack | 2.9 / 6.6 / 10.5 s | 2.9 / 6.8 / 10.5 s | at most 4 / 9 / 15 s |
+| Max chassis tilt | 1.3° | 3.2° | under 5° |
+| Container tasks, success | 60/60 (100%) | 60/60 (100%) | at least 90% |
+| Container tasks, clean | 51/60 (85%) | 56/60 (93.3%) | included in overall clean target |
+| Box-fill family, clean | 13/20 (65%) | 17/20 (85%) | included in overall clean target |
+
+The tests check Stop during release, no later retreat, retaining a load during GoTo, contact with every container wall, two 6 cm cubes side by side, the active final-skill deadline and restarting after cancellation. They also reject a gate missing mandatory families or hiding excess repeats and budget overruns. Typecheck, `check-agent` and the production build pass.
+
+A separate real Jev sample, seed 1500, has 30/30 successful and clean tasks, one call each, no repeated settings and no budget overruns. One run has a base contact, so this small sample does not meet the 98% no-contact target and is not a full release gate (`--no-gate`). Its printed median is 7.0 s and p90 45.2 s. The benchmark uses nearest-rank quantiles. The midpoint median for these 30 samples is 7.25 s. Median input is 2,236 tokens, about $0.000094 at the documented input price.
+
+Remaining physical limits are real: difficult container scenes can shift the container or tip a box, and stopping on contact does not undo movement already caused by that contact. The default sample includes a 21.5 cm container shift. One spread-stack run safely stops because the arm cannot clear the objects. Filling succeeds in every container case above, but it is not always clean. Emptying a container and arbitrary multi-step goals are not supported by this task reader.
+
+Rejected iterations are not release evidence: the first strict check was 295/300 clean but 7.5 s median. A faster arm with corner-first packing was 282/300 clean and 7.4 s. An intermediate safer setting was 297/300 clean and 7.2 s, while its heldout sample missed the no-contact target. The final settings above replace them.
+
 Not done as planned:
 - Timestep 0.01: CPU per run went from 1.7 to 1.2 s only, and the base got worse (a base contact, tilt 3°, median 7.7 s). The model keeps 0.005.
 - The pivot: the base turns about a point 2.5 cm ahead of the arm's base, not its chassis centre (the arm loads the front wheels). The planner uses the measured point.
 - Pose noise in the bench (5 mm, 5°) is not built: the skills still read true poses.
+- The cost target is not met in the measured live examples: about $0.0001 per task, not about $0.00005. They use about 2,350 input tokens in one Jev call.
 

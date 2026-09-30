@@ -4,11 +4,11 @@ import loadMujoco from "@mujoco/mujoco";
 import { readdirSync, readFileSync } from "node:fs";
 import { runAgent, type AgentEvent, type Decide, type JevRequest } from "../src/agent";
 import { plan, type Task } from "../src/plan";
-import { STEP, TURN, createRobot, loadModel, type Obj, type Vec3 } from "../src/robot";
+import { GRIPPER, OPEN, STEP, TURN, createRobot, loadModel, type Obj, type Vec3 } from "../src/robot";
 import { closeJaws, lift, lowerToObject, moveAbove, openJaws, type Ctx } from "../src/skills";
 import { simWorld } from "../src/world";
 import jevFunction from "../netlify/functions/jev";
-import { QUICK, createBench } from "./bench-core";
+import { QUICK, createBench, gate, summarize, type Record as BenchRecord } from "./bench-core";
 
 const dir = new URL("../model/", import.meta.url).pathname;
 const files = ["scene_web.xml", "so101.xml", ...readdirSync(dir + "assets").map((f) => "assets/" + f)].map(
@@ -253,6 +253,46 @@ events = await loop("Take the box", reading("take"), { signal: controller.signal
 end = last(events);
 report(end.outcome === "stopped", "Stop ends the run", end.text);
 
+const normalPlay = robot.play.bind(robot);
+for (const into of [false, true]) {
+  fresh();
+  const moving = robot.focus!;
+  const target = robot.add(into ? "container" : "box")!;
+  robot.place(moving, 0.18, -0.055, 0);
+  robot.place(target, into ? 0.5 : 0.22, into ? -0.3 : 0.065, 0);
+  robot.reset();
+  const stop = new AbortController();
+  let lowered = false, canceled = false, afterStop = 0;
+  robot.play = (...args: Parameters<typeof robot.play>) => {
+    if (stop.signal.aborted) afterStop++;
+    const motion = normalPlay(...args);
+    if (lowered && !canceled && args[0].at(-1)?.[GRIPPER] === OPEN) {
+      canceled = true;
+      stop.abort();
+    }
+    return motion;
+  };
+  events = await loop(into ? `put ${moving.label} in the container` : `put ${moving.label} on ${target.label}`,
+    reading(into ? "put_in" : "put_on", { object: moving.label, onto: target.label }),
+    { signal: stop.signal, onEvent: (e) => { if (e.type === "result" && e.action === "lower_to_place") lowered = true; } });
+  robot.play = normalPlay;
+  report(canceled && last(events).outcome === "stopped" && afterStop === 0,
+    `Stop during ${into ? "container" : "box"} release never starts retreat`, `${afterStop} motions after Stop`);
+}
+fresh();
+let slowed = false;
+robot.play = (path, duration, settle, until, hold) => {
+  if (!slowed) { slowed = true; duration = 100; }
+  return normalPlay(path, duration, settle, until, hold);
+};
+let deadlineStart = robot.data.time;
+events = await loop("take the box", reading("take"), { onEvent: (e) => { if (e.type === "skill") deadlineStart = robot.data.time; } });
+robot.play = normalPlay;
+report(last(events).outcome === "budget" && robot.data.time - deadlineStart <= 80.11 && robot.limit === null,
+  "the deadline cancels an active final skill", `${(robot.data.time - deadlineStart).toFixed(2)} s: ${last(events).text}`);
+fresh();
+report(last(await loop("take the box", reading("take"))).outcome === "success", "a new run works after Stop or deadline");
+
 // 8. Reading the goal: code checks Jev's reading.
 fresh();
 robot.add("box");
@@ -355,6 +395,18 @@ robot.remove(bin);
 end = last(await loop("put the ball in the container", reading("put_in", { object: balls[0].label })));
 report(end.outcome === "error" && /no container/.test(end.text), "no container: the task says so", end.text);
 
+const cubes = scene(["box", "box"], false);
+const cubeBin = robot.add("container")!;
+robot.place(cubeBin, 0.5, -0.3, 0.4);
+for (const o of cubes) robot.resize(o, [0.03, 0.03, 0.03]);
+robot.place(cubes[0], 0.2, 0.1, 0);
+robot.place(cubes[1], -0.1, 0.4, 0.7);
+robot.reset();
+settle(0.5);
+events = await loop("fill the container with the boxes", reading("fill", { which: "boxes" }));
+report(last(events).outcome === "success" && cubes.every((o) => robot.inside(o, cubeBin) && robot.object(o).bottom < 0.01),
+  "fill with two 6 cm cubes side by side, not above the rim", last(events).text);
+
 // When code has no way left, Jev chooses. A box too heavy to lift: every way to pick it fails, Jev says retry,
 // every way fails again, Jev says stop, and the run ends saying why.
 fresh();
@@ -398,6 +450,33 @@ base = await drive(robot.move("drive", STEP));
 const pushed = Math.hypot(robot.object(robot.focus!).world[0] - touchedAt[0], robot.object(robot.focus!).world[1] - touchedAt[1]);
 report(base.bumped === robot.focus && pushed < 0.01, "driving on into a box it touches stops: it never pushes", `pushed ${(pushed * 100).toFixed(1)} cm`);
 
+fresh();
+robot.remove(robot.focus!);
+const wall = robot.add("container")!;
+robot.place(wall, 0.2, 0, 0);
+settle(0.3);
+const normalStep = robot.step.bind(robot);
+let wallContacts = 0, recognizedWall = false;
+robot.step = () => {
+  normalStep();
+  const contacts = robot.data.contact;
+  for (let i = 0; i < robot.data.ncon; i++) {
+    const c = contacts.get(i);
+    if (c) {
+      const other = wall.geoms.slice(1).includes(c.geom1) ? c.geom2 : wall.geoms.slice(1).includes(c.geom2) ? c.geom1 : -1;
+      if (other >= 0 && robot.model.geom_bodyid[other] > 0 && !wall.geoms.includes(other)) {
+        wallContacts++;
+        recognizedWall ||= robot.touching(wall).arm;
+      }
+      c.delete();
+    }
+  }
+  contacts.delete();
+};
+base = await drive(robot.move("drive", STEP));
+robot.step = normalStep;
+report(base.bumped === wall && wallContacts > 0 && recognizedWall, "all container walls take part in contact checks", `${wallContacts} robot-wall contacts, recognized ${recognizedWall}`);
+
 // Moves asked for in the goal: code plans and drives them, no Jev call after the reading.
 fresh();
 robot.remove(robot.focus!); // a clear floor ahead
@@ -419,6 +498,18 @@ events = await loop("drive to the box and pick it up", reading("take"));
 end = last(events);
 const drove = events.some((e) => e.type === "plan" && e.plan.steps[0]?.text === "Drive to Box 1");
 report(end.outcome === "success" && robot.held() && drove && skills(events).join() === "drive,pick", "drive to a box out of reach, then pick it up", `${skills(events).join(" > ")}: ${end.text}`);
+fresh();
+robot.remove(robot.focus!);
+const payload = robot.add("ball")!;
+robot.place(payload, 0.2, 0.055, 0);
+robot.reset();
+settle(0.5);
+await loop(`take ${payload.label}`, reading("take", { object: payload.label }));
+const destination = robot.add("box")!;
+robot.place(destination, 0.65, 0, 0);
+events = await loop(`go to ${destination.label}`, reading("drive_to", { object: destination.label }));
+report(last(events).outcome === "success" && robot.gripped(payload), "GoTo another object keeps the existing payload", last(events).text);
+
 // Put a far box on a near one: drive to it, take it, carry it back on the base, set it down.
 const [near, far] = scene(["box", "box"], false);
 robot.place(near, 0.2, 0.12, 0);
@@ -437,11 +528,26 @@ end = last(await loop("stack all the boxes", reading("stack_boxes")));
 report(end.outcome === "success", "stack 3 boxes after the base has turned", end.text);
 // The quick bench: random scenes from the bench families that must end clean.
 const bench = createBench(robot);
+let sample: BenchRecord | undefined;
 for (const { family, seeds } of QUICK)
   for (const seed of seeds) {
     const r = await bench.run(family, seed, "rules");
+    sample = r;
     report(r.clean, `bench ${family} #${seed} ends clean`, `${r.outcome} in ${r.taskSeconds} s: ${r.endText}${r.events.length ? ` | ${r.events.map((e) => e.kind).join(",")}` : ""}`);
   }
+const safeFamilies = ["near_take_ball_selected", "blocked_take", "forward_blocked", "turn_clutter", "far_take", "near_stack", "container_put"];
+const synthetic = safeFamilies.flatMap((family) => Array.from({ length: 40 }, () => ({ ...sample!, family, success: true, clean: true, baseTouch: false, calls: 1, taskSeconds: 2, simSeconds: 1.8, budgetSeconds: 80, repeats: 0, maxTilt: 0 })));
+report(gate(summarize(synthetic)).length === 0, "the gate accepts a fully passing benchmark");
+synthetic[40].clean = false;
+synthetic[0].repeats = 3;
+synthetic[1].simSeconds = 501;
+const violations = gate(summarize(synthetic));
+report(violations.some((s) => s.includes("mandatory safety")) && violations.some((s) => s.includes("repeated")) && violations.some((s) => s.includes("budget")),
+  "the gate rejects unsafe families, repeated settings and deadline overruns", violations.join("; "));
+report(gate(summarize(synthetic.filter((r) => r.family !== "blocked_take"))).some((s) => s.includes("mandatory safety")), "missing mandatory families cannot pass the gate");
+const noPush = await bench.run("container_fill", 6019, "rules");
+report(noPush.clean && !noPush.events.some((e) => e.kind === "arm_touch_driving" || e.kind === "base_push"), "container fill #6019 no longer pushes its contents", noPush.endText);
+
 // Every run above frees what it reads from the WASM heap.
 const growth = (heap() - heapStart) / 1e6;
 report(growth < 64, "WASM memory stays flat across all runs", `${(heapStart / 1e6).toFixed(0)} MB at start, +${growth.toFixed(0)} MB`);

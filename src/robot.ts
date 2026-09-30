@@ -69,6 +69,11 @@ const SPEED = 0.12; // m/s when driving straight
 const SPIN = 3; // rad/s asked of the chassis when turning; the wheels skid sideways, so it turns slower
 const SETTLE = 0.3; // seconds the wheels hold still after a move
 export type Moved = { moved: number; turned: number; bumped: Obj | null };
+// A steered move's speeds for this tick, from the arm frame's pose and the time step: forward m/s and turn
+// rate rad/s, or null once it is there.
+export type Control = (pose: { x: number; y: number; yaw: number }, dt: number) => [number, number] | null;
+// Skid steering turns slower than the wheel speeds say: asking this much more gets the turn rate asked for.
+const SKID = 2;
 
 // Files are [name, bytes] pairs: scene_web.xml, so101.xml and the meshes under assets/.
 export function loadModel(mujoco: MainModule, files: [string, Uint8Array][]) {
@@ -148,8 +153,9 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   let dragged: { o: Obj; pose: number[] } | null = null;
   let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void; until?: () => boolean } | null = null;
   // A base move: its start pose, how far it has turned so far, and when it stopped (-1 while it runs).
-  // `before`: the objects it touched at the start, with where they stood then.
-  type Rolling = { kind: "drive" | "turn"; amount: number; x: number; y: number; yaw: number; last: number; turned: number; start: number; stopped: number; before: Map<Obj, number[]>; bumped: Obj | null; done: (moved: Moved) => void };
+  // `before`: the objects it touched at the start, with where they stood then. A steered move asks `control`
+  // for its speeds every tick; `amount` is then its time limit in seconds.
+  type Rolling = { kind: "drive" | "turn" | "steer"; amount: number; x: number; y: number; yaw: number; last: number; turned: number; start: number; stopped: number; before: Map<Obj, number[]>; bumped: Obj | null; done: (moved: Moved) => void; control?: Control };
   let rolling: Rolling | null = null;
   let ticks = 0;
   // Parked, the base is braked: the "brake" weld in scene_web.xml holds the chassis where it stopped. Driving
@@ -219,9 +225,14 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     const speed = (cap: number, gain: number, floor: number) => Math.sign(left) * Math.min(cap, gain * Math.abs(left) + (near ? 0 : floor));
     let v = drive ? speed(Math.min(SPEED, 0.4 * t + 0.02), 3, 0.01) : 0;
     let w = drive ? -8 * r.turned : speed(Math.min(SPIN, 3 * t + 0.2), 6, 0.15);
+    if (r.kind === "steer") {
+      const asked = near ? null : r.control!(b, model.opt.timestep);
+      [v, w] = asked ? [asked[0], SKID * asked[1]] : [0, 0];
+      if (!asked && !near) r.stopped = data.time;
+    }
     if (!near) {
-      if (Math.abs(left) < (drive ? 0.002 : 0.004)) r.stopped = data.time;
-      if (t > 2 + 1.5 * Math.abs(r.amount) * (drive ? 1 / SPEED : 1)) r.stopped = data.time;
+      if (r.kind !== "steer" && Math.abs(left) < (drive ? 0.002 : 0.004)) r.stopped = data.time;
+      if (t > (r.kind === "steer" ? r.amount : 2 + 1.5 * Math.abs(r.amount) * (drive ? 1 / SPEED : 1))) r.stopped = data.time;
       if (r.stopped < 0 && ticks % 2 === 0) {
         const hit =
           [...bumping()].find((o) => !r.before.has(o)) ??
@@ -352,6 +363,17 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
         const { x, y, yaw } = base();
         const before = new Map([...bumping()].map((o) => [o, [data.xpos[3 * o.body], data.xpos[3 * o.body + 1]]]));
         rolling = { kind, amount, x, y, yaw, last: yaw, turned: 0, start: data.time, stopped: -1, before, bumped: null, done };
+        release();
+      });
+    },
+    // The base on its own controller: `control` sets the speeds every tick until it returns null, `limit`
+    // seconds at most. Stops at the first touch as a move does. Resolves once the wheels have held still.
+    steer(control: Control, limit: number) {
+      robot.stopBase();
+      return new Promise<Moved>((done) => {
+        const { x, y, yaw } = base();
+        const before = new Map([...bumping()].map((o) => [o, [data.xpos[3 * o.body], data.xpos[3 * o.body + 1]]]));
+        rolling = { kind: "steer", amount: limit, x, y, yaw, last: yaw, turned: 0, start: data.time, stopped: -1, before, bumped: null, done, control };
         release();
       });
     },

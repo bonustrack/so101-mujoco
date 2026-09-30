@@ -341,6 +341,15 @@ const approachTarget = (robot: Robot, o: Obj, target: Target, spot?: { x: number
   distance: target.top > 0.05 ? BEST : PICK,
   text: `Carry ${o.label} to ${target.object ? target.label : "the spot"}`,
 });
+// Driving up to an object, or to where the held object goes, from wherever the base stands: a skill's try from
+// another side.
+export function approachTo(robot: Robot, to: Obj | Target): Extract<Subgoal, { kind: "approach" }> {
+  if ("kind" in to) return approachObject(robot, to) as Extract<Subgoal, { kind: "approach" }>;
+  const held = robot.active().find(robot.gripped) ?? robot.focus!;
+  const [x, y] = robot.toWorld([to.x, to.y, 0]);
+  return approachTarget(robot, held, to, { x, y }) as Extract<Subgoal, { kind: "approach" }>;
+}
+
 // A step whose object or target is out of reach: first the drive to it, as a step of its own.
 function reachFirst(robot: Robot, sub: Subgoal, spot?: { x: number; y: number }): { step: Step; current: Subgoal } | null {
   if (sub.kind === "take" && !robot.gripped(sub.object) && !inReach(robot, robot.object(sub.object).pos)) {

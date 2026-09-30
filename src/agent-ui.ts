@@ -1,5 +1,5 @@
-// The Jev and Flow sections: key and model, the goal, Run and Stop, a live log of every turn, and what the calls cost.
-import { BASE_COMMANDS, question, runAgent, type AgentEvent, type ChoiceAnswer, type JevResponse } from "./agent";
+// The Jev and Flow sections: key and model, the goal, Run and Stop, a live log of every step, and what the calls cost.
+import { recoveryQuestion, runAgent, type AgentEvent, type ChoiceAnswer, type JevResponse } from "./agent";
 import { SUPPORTED, TASKS, type Plan } from "./plan";
 import { PRICE_NOTE, askJev, jevCost, listModels } from "./jev";
 import type { Obj, Robot } from "./robot";
@@ -19,7 +19,8 @@ const price = (t: Tally) =>
 const spent = (t: Tally) => `${t.calls} ${t.calls === 1 ? "call" : "calls"} · ${count(t.input)} in / ${count(t.output)} out · ${price(t)}`;
 
 // Taking one object, Jev's target is the one the goal names, else the selected object, else the first box.
-export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (locked: boolean) => void) {
+// `onPath` draws the base's planned path on the floor, or clears it with null.
+export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (locked: boolean) => void, onPath: (points: [number, number][] | null) => void = () => {}) {
   const key = $<HTMLInputElement>("jev-key");
   const model = $<HTMLSelectElement>("jev-model");
   const goal = $<HTMLTextAreaElement>("goal");
@@ -30,7 +31,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   const flow = $("flow");
   const stages = [...$("diagram").querySelectorAll<HTMLElement>("li")];
   $("question").textContent = JSON.stringify(
-    { read_the_goal: { task: TASKS }, take_one_object: question("take"), put_one_on_another: question("place") },
+    { read_the_goal: { task: TASKS }, when_code_has_no_way_left: recoveryQuestion(true) },
     null,
     2,
   );
@@ -72,7 +73,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
     if (controller) return;
     status.textContent = key.value.trim() ? `Ready. Press Run. ${SUPPORTED}` : `Paste a key, then press Run. ${SUPPORTED}`;
   };
-  // Driving the base is physics too.
+  // Driving the base is motion too; Jev's recovery call lights up Jev.
   const highlight = (stage: string | null) => stages.forEach((li) => li.classList.toggle("on", li.dataset.stage === (stage === "drive" ? "physics" : stage)));
 
   // Fill the model list from GET /v1/models once a key is present; keep the saved choice.
@@ -134,14 +135,15 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
     idle();
     flow.replaceChildren();
     planBox.hidden = true;
-    let turns = 0;
-    let turn = 0;
+    let step = 0;
+    let subgoal = "";
     let task = "";
     follow = true;
     runCost = tally();
     showCost();
     $<HTMLDetailsElement>("how").open = false; // room for the log; the diagram stays in view
-    highlight("goal");
+    highlight("jev");
+    onPath(null);
     let current: HTMLElement = flow;
     const add = (html: string, className = "") => {
       const row = document.createElement(current === flow ? "li" : "div");
@@ -195,11 +197,10 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
       switch (event.type) {
         case "stage":
           highlight(event.stage);
-          status.textContent = turn ? `Turn ${turn} of ${turns}: ${STAGE_TEXT[event.stage]}` : `Reading the goal: ${STAGE_TEXT[event.stage]}`;
+          status.textContent = step ? `Step ${step}, ${subgoal}: ${STAGE_TEXT[event.stage]}` : `Reading the goal: ${STAGE_TEXT[event.stage]}`;
           break;
         case "task": {
           task = event.name;
-          turns = event.maxTurns;
           current = document.createElement("li");
           current.innerHTML = `<h3>Goal</h3>`;
           flow.append(current);
@@ -209,7 +210,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
             decision("Jev read it as", event.answers.task, event.model, event.ms, event.usage, unsure ? `<p class="meta">Low confidence ${round(event.confidence)}: Jev is not sure about this reading. Check it in the plan above.</p>` : ""),
             unsure ? "unsure" : "",
           );
-          add(`<p><span class="tag">Task</span>${escape(event.text)}</p>`, event.ok ? "" : "error");
+          add(`<p><span class="tag">Task</span>${escape(event.text)}${event.ok ? ` <span class="meta">Up to ${event.budget} s of motion.</span>` : ""}</p>`, event.ok ? "" : "error");
           const head = planBox.querySelector("p")!;
           head.innerHTML = `<strong>${escape(event.text)}</strong>` + (unsure ? ` <span class="unsure">Jev is not sure (confidence ${round(event.confidence)}).</span>` : "");
           planBox.querySelector("ol")!.replaceChildren();
@@ -217,42 +218,38 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
           break;
         }
         case "plan":
-          turns = event.maxTurns;
           showPlan(event.plan);
           break;
-        case "turn": {
-          turn = event.turn;
-          current = document.createElement("li");
-          current.innerHTML = `<h3>Turn ${event.turn} <span class="meta-inline">${escape(event.subgoal)}</span></h3>`;
-          flow.append(current);
-          sent("goal, observation, history", event.request.state);
-          break;
-        }
         case "skill": {
-          // Code drives the base on its own: a path on a map of the floor, no Jev call.
-          turn = event.turn;
+          // Code runs each step: no Jev call.
+          step = event.step;
+          subgoal = event.subgoal;
           current = document.createElement("li");
-          current.innerHTML = `<h3>Turn ${event.turn} <span class="meta-inline">${escape(event.subgoal)}, planned in code</span></h3>`;
+          const again = event.attempt > 1 ? `, try ${event.attempt}: ${escape(event.how)}` : "";
+          current.innerHTML = `<h3>${SKILL_TEXT[event.skill]} <span class="meta-inline">${escape(event.subgoal)}${again}</span></h3>`;
           flow.append(current);
           break;
         }
-        case "decision": {
-          highlight("command");
-          const unsure = event.answer.confidence < 0.5;
-          add(
-            decision("Jev chose", event.answer, event.model, event.ms, event.usage, unsure ? `<p class="meta">Low confidence: Jev is not sure, the top choice runs anyway.</p>` : ""),
-            unsure ? "unsure" : "",
-          );
+        case "path":
+          onPath(event.points);
+          break;
+        case "recovery": {
+          current = document.createElement("li");
+          current.innerHTML = `<h3>Jev helps <span class="meta-inline">code has no way left</span></h3>`;
+          flow.append(current);
+          sent("goal, step, what was tried", event.request.state);
+          add(decision("Jev chose", event.answer, event.model, event.ms, event.usage), event.answer.confidence < 0.5 ? "unsure" : "");
           break;
         }
         case "result":
-          add(`<p><span class="tag">${BASE_COMMANDS.includes(event.command) ? "Base" : "Arm"}</span>${escape(event.text)}</p>`);
+          add(`<p><span class="tag">${BASE_ACTIONS.includes(event.action) ? "Base" : "Arm"}</span>${escape(event.text)}</p>`);
           break;
         case "check":
           add(`<p><span class="tag">Check</span>${escape(event.text)}</p>`, event.success ? "ok" : "");
           break;
         case "end": {
           current = flow;
+          onPath(null);
           const word = event.outcome === "success" ? (DONE_TEXT[task] ?? "Done.") : END_TEXT[event.outcome];
           add(`<p><strong>${word}</strong> ${escape(event.text)}</p>`, `end ${event.outcome}`);
           status.textContent = `${word} ${event.text}`;
@@ -286,19 +283,20 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
 }
 
 const STAGE_TEXT: Record<string, string> = {
-  observe: "reading the scene",
+  plan: "planning",
   jev: "waiting for Jev",
-  ik: "solving the joint angles",
+  ik: "planning the path and the joint angles",
   physics: "moving the arm",
   drive: "driving the base",
   check: "checking the result",
 };
+const SKILL_TEXT: Record<string, string> = { drive: "Drive", pick: "Pick", place: "Place" };
+const BASE_ACTIONS = ["drive", "drive_to_object", "back_off"];
 const DONE_TEXT: Record<string, string> = { take: "Lifted.", stack_boxes: "Stacked.", stack_all: "Stacked.", put_on: "Placed.", drive: "Moved.", drive_to: "Arrived." };
 const END_TEXT: Record<Extract<AgentEvent, { type: "end" }>["outcome"], string> = {
   success: "Done.",
-  done: "Jev stopped.",
+  done: "Not done.",
   stopped: "Stopped.",
-  turns: "Out of turns.",
   stuck: "Stuck.",
   budget: "Out of time.",
   error: "Error.",

@@ -2,10 +2,10 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import type { MainModule, MjModel } from "@mujoco/mujoco";
-import { COMMANDS } from "./agent";
 import { setupAgent } from "./agent-ui";
 import { setupEditor, type Editor } from "./editor";
 import { JOINTS, REST, createRobot, loadModel, type Obj, type Robot } from "./robot";
+import { PAD } from "./skills";
 import "./style.css";
 
 // Poses in radians, one value per joint (from examples/so101.py).
@@ -69,6 +69,15 @@ const grid = new THREE.GridHelper(4, 40, 0xd6d6cf, 0xe0e0da);
 grid.rotation.x = Math.PI / 2;
 grid.position.z = 0.0005;
 scene.add(grid);
+// The path the base is driving, drawn on the floor.
+const path = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x1f6feb }));
+path.visible = false;
+path.frustumCulled = false;
+scene.add(path);
+function showPath(points: [number, number][] | null) {
+  path.visible = !!points && points.length > 1;
+  if (points) path.geometry.setFromPoints(points.map(([x, y]) => new THREE.Vector3(x, y, 0.001)));
+}
 
 const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 50);
 camera.up.set(0, 0, 1);
@@ -165,10 +174,15 @@ loading
     refreshControls = controls.refresh;
     let agent: ReturnType<typeof setupAgent> | null = null;
     const edit = setupEditor({ robot: sim.robot, camera, canvas: renderer.domElement, scene, meshes: sim.meshes, onChange: () => agent?.refresh() });
-    agent = setupAgent(sim.robot, edit.selected, (locked) => {
-      controls.lock(locked);
-      edit.lock(locked);
-    });
+    agent = setupAgent(
+      sim.robot,
+      edit.selected,
+      (locked) => {
+        controls.lock(locked);
+        edit.lock(locked);
+      },
+      showPath,
+    );
     controls.onDrive(() => agent?.refresh());
     controls.onReset(agent.stop);
     editor = edit;
@@ -351,7 +365,7 @@ function buildControls(robot: Robot) {
       driving = true;
       button.classList.add("active");
       buttons.forEach((b) => b.classList.remove("active"));
-      await COMMANDS[button.dataset.command!].run!(robot, () => {});
+      await PAD[button.dataset.command!](robot);
       button.classList.remove("active");
       driving = false;
       afterDrive();

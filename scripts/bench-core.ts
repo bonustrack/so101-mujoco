@@ -189,21 +189,10 @@ export function createBench(robot: Robot) {
         const answers = Object.fromEntries(Object.entries(r.questions).map(([q, { criteria }]) => [q, choice(q === "task" ? truth.task : (truth.picks[q] ?? Object.keys(criteria)[0]), Object.keys(criteria))]));
         return { model: "rules", answers, usage };
       }
-      const o = r.state.observation as { [k: string]: string };
-      const options = Object.keys(r.questions.next_command.criteria);
-      const name = o.to_go
-        ? /forward/.test(o.to_go) ? "drive_forward" : /back/.test(o.to_go) ? "drive_backward" : /left/.test(o.to_go) ? "turn_left" : "turn_right"
-        : o.destination ? "drive_to_object"
-        : o.gripper_vs_object === "holding the object"
-          ? options.includes("lift") ? "lift"
-          : o.object_vs_target === "away from the target" ? "move_above_target" : o.object_vs_target === "above the target" ? "lower_to_place" : "release"
-        : o.gripper_vs_object === "open around the placed object" ? "retreat"
-        : o.gripper_vs_object === "clear of the placed object" ? "done"
-        : o.gripper_vs_object === "the object is between the jaws" ? "close_gripper"
-        : o.gripper !== "open" ? "open_gripper"
-        : o.gripper_vs_object === "above the object" ? "lower_to_object"
-        : "move_above_object";
-      return { model: "rules", answers: { next_command: choice(name, options) }, usage };
+      // When code has no way left: once more, then leave the object out where the question allows it, else stop.
+      const options = Object.keys(r.questions.recovery.criteria);
+      const name = r.state.already_retried === "no" ? "retry" : options.includes("skip") ? "skip" : "stop";
+      return { model: "rules", answers: { recovery: choice(name, options) }, usage };
     };
   }
 
@@ -227,10 +216,7 @@ export function createBench(robot: Robot) {
       const t0 = performance.now();
       try {
         const out = await inner(r, s);
-        if (mode === "jev" && r.questions.next_command && !r.questions.task) {
-          const want = (await truth(r, s)).answers.next_command.choice;
-          if (out.answers.next_command?.choice !== want) note("jev_off_rules", `Jev chose ${out.answers.next_command?.choice}, the rules say ${want}`);
-        }
+        if (r.questions.recovery) note("recovery", `Jev chose ${out.answers.recovery?.choice} after: ${(r.state.tried as string[]).at(-1)}`);
         calls++;
         inputTokens += out.usage?.input_tokens ?? 0;
         return out;
@@ -370,7 +356,7 @@ export function createBench(robot: Robot) {
       maxTilt: round(r.maxTilt),
       baseTouch: evs.some((e) => e.kind === "base_touch"),
       repeats: repeats(events),
-      commands: events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : [])).join(" > "),
+      steps: events.flatMap((e) => (e.type === "skill" ? [`${e.skill}${e.attempt > 1 ? ` #${e.attempt}` : ""}`] : [])).join(" > "),
       events: evs,
     };
   }
@@ -380,24 +366,19 @@ export function createBench(robot: Robot) {
 
 const round = (x: number) => Math.round(x * 10) / 10;
 
-// The most times one arm command, or one drive up to something, ran in a row within one subgoal with nothing
-// changing. Steps of a plain drive or turn do not count: they are meant to repeat.
+// The most times one step failed the same way in a run: a try failed when the next try of that step is the
+// next way, or when Jev is asked what to do.
 function repeats(events: AgentEvent[]) {
-  const STEPS = ["drive_forward", "drive_backward", "turn_left", "turn_right"];
-  let best = 0;
-  let run = 0;
-  let last = "";
-  let sub = "";
-  for (const e of events) {
-    if (e.type === "turn" || e.type === "skill") sub = e.subgoal;
-    if (e.type !== "result") continue;
-    const key = `${sub}|${e.command}|${e.text}`;
-    const counts = !STEPS.includes(e.command) || /Stopped early/.test(e.text);
-    run = counts && key === last ? run + 1 : counts ? 1 : 0;
-    last = key;
-    best = Math.max(best, run);
-  }
-  return best;
+  const seen = new Map<string, number>();
+  const skills = events.filter((e) => e.type === "skill" || e.type === "recovery");
+  skills.forEach((e, i) => {
+    if (e.type !== "skill") return;
+    const next = skills.slice(i + 1).find((n) => n.type === "recovery" || n.subgoal === e.subgoal);
+    const failed = next?.type === "recovery" || (next?.type === "skill" && next.attempt > e.attempt);
+    const key = `${e.subgoal}|${e.how}`;
+    if (failed) seen.set(key, (seen.get(key) ?? 0) + 1);
+  });
+  return Math.max(0, ...seen.values());
 }
 
 // The reading names the right task and objects.
@@ -477,7 +458,7 @@ export const TARGETS = {
   container: 90, // % success
 };
 // The floor each phase ships on: raised as the phases land.
-export const GATE = { clean: 92, wrongObject: 100, noBaseTouch: 98, maxTilt: 5 };
+export const GATE = { clean: 95, wrongObject: 100, noBaseTouch: 98, maxTilt: 5, callsMedian: 1, callsP90: 2 };
 
 export function gate(s: Summary, floor: { [k: string]: number } = GATE) {
   const fails: string[] = [];

@@ -5,8 +5,9 @@
 // Poses here are world coordinates on the floor. Paths are planned for the point the base turns about on the
 // spot: measured, 2.5 cm ahead of the arm's base, since the arm loads the front wheels. `pivot` converts.
 import { BODY, wrap, type Obj, type Robot } from "./robot";
+import type { Pose, World } from "./world";
 
-export type Pose = { x: number; y: number; yaw: number };
+export type { Pose };
 const PIVOT = 0.025; // in the arm's frame; a 90° turn drifts about 5 mm around it
 const CX = (BODY.front + BODY.back) / 2 - PIVOT; // the outline's centre, from the pivot: 5 cm behind
 const HALF_L = (BODY.front - BODY.back) / 2; // 10.5 cm
@@ -19,8 +20,9 @@ const STRIDE = 0.04; // one straight move
 const REACHED = 0.03; // a path ends this close to its goal; the follower corrects the rest
 const EXPANSIONS = 200_000;
 
-// The pivot of the base whose arm's frame stands at `p`.
+// The pivot of the base whose arm's frame stands at `p`, and back.
 export const pivot = (p: Pose): Pose => ({ x: p.x + PIVOT * Math.cos(p.yaw), y: p.y + PIVOT * Math.sin(p.yaw), yaw: p.yaw });
+export const armOf = (p: Pose): Pose => ({ x: p.x - PIVOT * Math.cos(p.yaw), y: p.y - PIVOT * Math.sin(p.yaw), yaw: p.yaw });
 
 // ---- the map ----
 
@@ -32,21 +34,14 @@ type Circle = { x: number; y: number; r: number; top: number; obj: Obj; soft: bo
 type Part = { x: number; y: number; r: number; above: number };
 export type FloorMap = { circles: Circle[]; parts: Part[]; margin: number };
 
-// What stands on the floor now, from the physics state: every object but the one in the jaws. The folded
-// jaws, 12 cm up and 15 cm ahead, only meet a tower; an object in the jaws meets what stands higher than
-// its bottom.
-export function floorMap(robot: Robot, soft: Obj[] = [], margin = MARGIN): FloorMap {
-  const held = robot.active().find(robot.gripped);
-  const circles = robot.active().flatMap((o) => {
-    if (o === held) return [];
-    const f = robot.object(o);
-    return [{ x: f.world[0], y: f.world[1], r: robot.footprint(o), top: f.top, obj: o, soft: soft.includes(o) }];
-  });
+// What stands on the floor now, from the world: every object but the one in the jaws. The folded jaws, 12 cm
+// up and 15 cm ahead, only meet a tower; an object in the jaws meets what stands higher than its bottom.
+export function floorMap(world: World, soft: Obj[] = [], margin = MARGIN): FloorMap {
+  const seen = world.objects();
+  const held = seen.find((o) => o.held);
+  const circles = seen.flatMap((o) => (o === held ? [] : [{ x: o.world[0], y: o.world[1], r: o.footprint, top: o.top, obj: o.obj, soft: soft.includes(o.obj) }]));
   const parts: Part[] = [{ x: 0.15 - PIVOT, y: 0, r: 0.03, above: 0.115 }];
-  if (held) {
-    const f = robot.object(held);
-    parts.push({ x: f.pos[0] - PIVOT, y: f.pos[1], r: robot.footprint(held), above: f.bottom - 0.01 });
-  }
+  if (held) parts.push({ x: held.pos[0] - PIVOT, y: held.pos[1], r: held.footprint, above: held.bottom - 0.01 });
   return { circles, parts, margin };
 }
 
@@ -311,44 +306,154 @@ export function goalsForMove(map: FloorMap, from: Pose, turn: boolean, amount: n
 
 // ---- the follower ----
 
-export type Drove = { ok: boolean; bumped: Obj | null; moved: number };
+export type Drove = { ok: boolean; bumped: Obj | null; moved: number; text?: string };
+export type Drive = {
+  speed: number; // m/s at most on straight parts
+  accel: number; // m/s² speeding up and slowing down
+  signal?: AbortSignal;
+  // Called once when the last part of the path has `within` metres left: the arm gets ready meanwhile.
+  near?: { within: number; run: () => void };
+};
+// Turns up to this size between two straight parts are smoothed into a curve; bigger ones are made on the spot.
+const SMOOTH = 0.61;
+const STUCK = 2; // seconds without 1 cm of progress
 
-// Drive a path segment by segment with the base's own controller. Before each straight line it turns to face
-// the line's end from where it really is, so small slips do not add up. At the end it drives what is left along
-// its heading and turns to the goal's heading. Stops at the first touch.
-export async function follow(robot: Robot, path: Path, signal?: AbortSignal): Promise<Drove> {
-  let moved = 0;
-  const here = () => pivot(robot.base());
-  // Turn to `yaw`, the planned way round when `amount` is given.
-  const turnTo = async (yaw: number, amount?: number) => {
-    const d = amount === undefined ? wrap(yaw - robot.base().yaw) : amount + wrap(yaw - amount - robot.base().yaw);
-    if (Math.abs(d) < 0.01) return null;
-    return (await robot.move("turn", d)).bumped;
-  };
-  const drive = async (d: number) => {
-    if (Math.abs(d) < 0.004) return null;
-    const r = await robot.move("drive", d);
-    moved += Math.abs(r.moved);
-    return r.bumped;
-  };
-  for (const seg of path.segments) {
-    if (signal?.aborted) return { ok: false, bumped: null, moved };
-    let bumped: Obj | null;
-    if (seg.kind === "turn") bumped = await turnTo(seg.yaw, seg.amount);
-    else {
-      const c = here();
-      const d = Math.hypot(seg.x - c.x, seg.y - c.y);
-      const face = Math.atan2(seg.y - c.y, seg.x - c.x) + (seg.back ? Math.PI : 0);
-      bumped = d > 0.02 && Math.abs(wrap(face - c.yaw)) > 0.03 ? await turnTo(face) : null;
-      if (!bumped) {
-        const e = here();
-        bumped = await drive((seg.back ? -1 : 1) * Math.hypot(seg.x - e.x, seg.y - e.y));
-      }
+type Leg = { kind: "turn"; yaw: number; amount: number } | { kind: "run"; points: [number, number][]; back: boolean };
+// The path as legs: turns on the spot, and runs of straight parts in one direction, smoothed through small turns.
+function legs(start: Pose, segments: Segment[]): Leg[] {
+  const out: Leg[] = [];
+  let at: [number, number] = [start.x, start.y];
+  let run: Extract<Leg, { kind: "run" }> | null = null;
+  segments.forEach((seg, i) => {
+    if (seg.kind === "turn") {
+      const next = segments[i + 1];
+      const prev = run ? true : out.length === 0;
+      if (Math.abs(seg.amount) <= SMOOTH && next?.kind === "line" && prev && (!run || run.back === next.back)) return;
+      run = null;
+      out.push(seg);
+      return;
     }
-    if (bumped) return { ok: false, bumped, moved };
+    if (!run || run.back !== seg.back) {
+      run = { kind: "run", points: [at], back: seg.back };
+      out.push(run);
+    }
+    run.points.push([seg.x, seg.y]);
+    at = [seg.x, seg.y];
+  });
+  return out;
+}
+
+// Drive a path. Runs are followed with pure pursuit on the pivot: steer toward the point a few cm ahead on the
+// path, as fast as the path left allows, slowing to stop at its end. Turns on the spot use the base's own
+// turn. At the end it drives what is left along its heading and turns to the goal's heading. It stops at the
+// first touch, and when it makes no progress for 2 s.
+export async function follow(robot: Robot, path: Path, drive: Drive): Promise<Drove> {
+  let moved = 0;
+  let near = drive.near;
+  const all = legs(pivot(robot.base()), path.segments);
+  const lastRun = all.map((l) => l.kind).lastIndexOf("run");
+  for (const [i, leg] of all.entries()) {
+    if (drive.signal?.aborted) return { ok: false, bumped: null, moved };
+    if (leg.kind === "turn") {
+      const d = leg.amount + wrap(leg.yaw - leg.amount - robot.base().yaw);
+      if (Math.abs(d) < 0.01) continue;
+      const r = await robot.move("turn", d);
+      if (r.bumped) return { ok: false, bumped: r.bumped, moved };
+      continue;
+    }
+    const r = await pursue(robot, leg, drive, i === lastRun ? near : undefined);
+    if (i === lastRun) near = undefined;
+    moved += r.moved;
+    if (!r.ok) return { ...r, moved };
   }
-  const c = here();
+  near?.run();
+  const c = pivot(robot.base());
   const along = (path.goal.x - c.x) * Math.cos(c.yaw) + (path.goal.y - c.y) * Math.sin(c.yaw);
-  const bumped = (await drive(along)) ?? (await turnTo(path.goal.yaw));
-  return { ok: !bumped, bumped, moved };
+  if (Math.abs(along) > 0.004) {
+    const r = await robot.move("drive", along);
+    moved += Math.abs(r.moved);
+    if (r.bumped) return { ok: false, bumped: r.bumped, moved };
+  }
+  const d = wrap(path.goal.yaw - robot.base().yaw);
+  if (Math.abs(d) > 0.01) {
+    const r = await robot.move("turn", d);
+    if (r.bumped) return { ok: false, bumped: r.bumped, moved };
+  }
+  return { ok: true, bumped: null, moved };
+}
+
+async function pursue(robot: Robot, leg: Extract<Leg, { kind: "run" }>, drive: Drive, near?: Drive["near"]): Promise<Drove> {
+  const pts = leg.points;
+  const lengths = pts.slice(1).map((p, i) => Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]));
+  const total = lengths.reduce((a, b) => a + b, 0);
+  const at = (s: number): [number, number] => {
+    for (let i = 0; i < lengths.length; i++) {
+      if (s <= lengths[i] || i === lengths.length - 1) {
+        const k = lengths[i] ? Math.min(1, Math.max(0, s / lengths[i])) : 1;
+        return [pts[i][0] + k * (pts[i + 1][0] - pts[i][0]), pts[i][1] + k * (pts[i + 1][1] - pts[i][1])];
+      }
+      s -= lengths[i];
+    }
+    return pts.at(-1)!;
+  };
+  let seg = 0;
+  let done = 0; // path length behind the pivot
+  let v = 0;
+  let best = 0;
+  let since = 0;
+  let stuck = false;
+  let travelled = 0;
+  let last: [number, number] | null = null;
+  const control = (arm: Pose, dt: number): [number, number] | null => {
+    const p = pivot(arm);
+    if (last) travelled += Math.hypot(p.x - last[0], p.y - last[1]);
+    last = [p.x, p.y];
+    // Where the pivot is along the path: the nearest point, never going back.
+    let before = lengths.slice(0, seg).reduce((a, b) => a + b, 0);
+    let bestD = Infinity;
+    for (let i = seg, acc = before; i < lengths.length; acc += lengths[i], i++) {
+      const [ax, ay] = pts[i];
+      const [bx, by] = pts[i + 1];
+      const len = lengths[i] || 1e-9;
+      const k = Math.min(1, Math.max(0, ((p.x - ax) * (bx - ax) + (p.y - ay) * (by - ay)) / (len * len)));
+      const d = Math.hypot(ax + k * (bx - ax) - p.x, ay + k * (by - ay) - p.y);
+      if (d < bestD - 1e-6) [bestD, seg, before, done] = [d, i, acc, acc + k * len];
+      if (d > bestD + 0.05) break;
+    }
+    const left = total - done;
+    if (left < 0.005) return null;
+    if (near && left < near.within) {
+      near.run();
+      near = undefined;
+    }
+    since += dt;
+    if (done > best + 0.01) [best, since] = [done, 0];
+    if (since > STUCK) {
+      stuck = true;
+      return null;
+    }
+    const ahead = at(Math.min(total, done + Math.max(0.05, Math.min(0.12, 0.05 + 0.25 * v))));
+    const h = arm.yaw + (leg.back ? Math.PI : 0);
+    const dx = ahead[0] - p.x;
+    const dy = ahead[1] - p.y;
+    const lx = Math.cos(h) * dx + Math.sin(h) * dy;
+    const ly = -Math.sin(h) * dx + Math.cos(h) * dy;
+    const alpha = Math.atan2(ly, lx);
+    // Far off its heading: turn toward the path first.
+    if (Math.abs(alpha) > 0.8) {
+      v = 0;
+      return [0, Math.max(-1.5, Math.min(1.5, 2 * alpha))];
+    }
+    const cap = Math.min(drive.speed, Math.sqrt(2 * drive.accel * left) + 0.01);
+    v = Math.min(cap, v + drive.accel * dt);
+    const w = Math.max(-2, Math.min(2, (2 * v * Math.sin(alpha)) / Math.max(0.02, Math.hypot(lx, ly))));
+    return [leg.back ? -v : v, w];
+  };
+  const r = await robot.steer(control, 3 + (3 * total) / drive.speed);
+  if (r.bumped) return { ok: false, bumped: r.bumped, moved: travelled };
+  if (stuck) return { ok: false, bumped: null, moved: travelled, text: "no progress for 2 s" };
+  const end = pts.at(-1)!;
+  const c = pivot(robot.base());
+  const off = Math.hypot(end[0] - c.x, end[1] - c.y);
+  return off < 0.03 ? { ok: true, bumped: null, moved: travelled } : { ok: false, bumped: null, moved: travelled, text: `${Math.round(off * 100)} cm off the path's end` };
 }

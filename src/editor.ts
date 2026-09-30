@@ -6,7 +6,7 @@ import { BODY, SIZE_RANGE, type Kind, type Obj, type Robot, type Vec3 } from "./
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const cm = (m: number) => `${Math.round(m * 1000) / 10} cm`;
-const SIDES = { box: ["Width", "Depth", "Height"], ball: ["Diameter"] };
+const SIDES = { box: ["Width", "Depth", "Height"], ball: ["Diameter"], container: [] };
 const NUDGE = 0.005; // arrow keys move the selection 5 mm, 2 cm with Shift
 
 export type Editor = ReturnType<typeof setupEditor>;
@@ -16,7 +16,7 @@ export function setupEditor(options: {
   camera: THREE.Camera;
   canvas: HTMLCanvasElement;
   scene: THREE.Scene;
-  meshes: Map<Obj, THREE.Object3D>;
+  meshes: Map<Obj, THREE.Object3D[]>; // one per geom: the container has five
   onChange: () => void; // the selection or a size changed: Jev's target may have too
 }) {
   const { robot, camera, canvas, scene, meshes, onChange } = options;
@@ -50,10 +50,10 @@ export function setupEditor(options: {
       if (event.target !== canvas || drag || !event.isPrimary) return;
       press = new THREE.Vector2(event.clientX, event.clientY);
       aim(event);
-      const shown = robot.active().map((o) => meshes.get(o)!);
+      const shown = robot.active().flatMap((o) => meshes.get(o)!);
       const first = raycaster.intersectObjects(shown, false)[0];
       if (!first) return;
-      const o = [...meshes].find(([, mesh]) => mesh === first.object)![0];
+      const o = [...meshes].find(([, list]) => list.includes(first.object))![0];
       event.stopPropagation();
       canvas.setPointerCapture(event.pointerId);
       select(o);
@@ -127,6 +127,7 @@ export function setupEditor(options: {
   // The Scene section.
   const addBox = $<HTMLButtonElement>("add-box");
   const addBall = $<HTMLButtonElement>("add-ball");
+  const addContainer = $<HTMLButtonElement>("add-container");
   const resetScene = $<HTMLButtonElement>("reset-scene");
   const panel = $("selection");
   const name = $("selected-name");
@@ -142,9 +143,10 @@ export function setupEditor(options: {
   };
   addBox.onclick = () => add("box");
   addBall.onclick = () => add("ball");
+  addContainer.onclick = () => add("container");
   resetScene.onclick = () => {
     select(null);
-    robot.resetScene();
+    robot.resetScene(true);
     refresh();
   };
   del.onclick = () => remove();
@@ -190,8 +192,10 @@ export function setupEditor(options: {
     const left = (kind: Kind) => robot.objects.some((o) => o.kind === kind && !o.active);
     addBox.disabled = locked || !left("box");
     addBall.disabled = locked || !left("ball");
+    addContainer.disabled = locked || !left("container");
     addBox.title = left("box") ? "Add a box" : "All 6 boxes are out";
     addBall.title = left("ball") ? "Add a ball" : "All 6 balls are out";
+    addContainer.title = left("container") ? "Add the container" : "The container is out";
     resetScene.disabled = locked;
     del.disabled = locked;
     if (selected) {
@@ -199,8 +203,8 @@ export function setupEditor(options: {
         input.disabled = locked;
         output.value = cm(2 * selected!.size[i]);
       });
-      const why = robot.tooBig(selected);
-      grab.textContent = why ? `Too big to grab: ${why}.` : "The arm can grab it.";
+      const why = selected.kind === "container" ? null : robot.tooBig(selected);
+      grab.textContent = selected.kind === "container" ? 'The arm puts objects in it: "fill the container with the balls".' : why ? `Too big to grab: ${why}.` : "The arm can grab it.";
       grab.classList.toggle("warn", !!why);
     }
     onChange();

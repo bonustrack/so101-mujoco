@@ -386,6 +386,11 @@ input[type="range"]:disabled {
   padding: 0 6px;
 }
 
+/* Box, ball, container, reset: two by two. */
+.scene-buttons {
+  grid-template-columns: 1fr 1fr;
+}
+
 .selected {
   display: flex;
   align-items: center;

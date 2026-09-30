@@ -196,12 +196,15 @@ type Sim = ReturnType<typeof createSim>;
 
 function createSim(mujoco: MainModule, files: [string, Uint8Array][]) {
   const robot = createRobot(mujoco, loadModel(mujoco, files));
+  // The page's first scene: the box, and the container to fill.
+  robot.resetScene(true);
+  robot.reset();
   const { root, items } = buildMeshes(mujoco, robot.model);
   const { model, data } = robot;
-  // The scene's boxes and balls, by object: the editor picks them, sync hides the unused ones.
-  const meshes = new Map<Obj, THREE.Object3D>();
-  const owner = new Map(robot.objects.map((o) => [o.geom, o]));
-  for (const { geom, object } of items) if (owner.has(geom)) meshes.set(owner.get(geom)!, object);
+  // The scene's boxes, balls and container, by object: the editor picks them, sync hides the unused ones.
+  const meshes = new Map<Obj, THREE.Object3D[]>();
+  const owner = new Map(robot.objects.flatMap((o) => o.geoms.map((g) => [g, o] as const)));
+  for (const { geom, object } of items) if (owner.has(geom)) meshes.set(owner.get(geom)!, [...(meshes.get(owner.get(geom)!) ?? []), object]);
   const scale = new THREE.Vector3();
   const sim = {
     robot,

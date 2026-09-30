@@ -22,6 +22,7 @@ export type World = {
   base(): Pose; // where the arm's frame stands and faces
   objects(): Seen[];
   see(o: Obj): Seen;
+  jaws(): Vec3; // the jaw tips, in the arm's frame
 };
 
 export function simWorld(robot: Robot): World {
@@ -29,5 +30,5 @@ export function simWorld(robot: Robot): World {
     const f = robot.object(o);
     return { obj: o, label: o.label, kind: o.kind, size: o.size, world: f.world, pos: f.pos, yaw: f.yaw, upright: f.upright, bottom: f.bottom, top: f.top, footprint: robot.footprint(o), held: robot.gripped(o) };
   };
-  return { base: robot.base, objects: () => robot.active().map(see), see };
+  return { base: robot.base, objects: () => robot.active().map(see), see, jaws: robot.tcp };
 }

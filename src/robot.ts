@@ -30,15 +30,16 @@ export const LIFTED = 0.05; // an object counts as lifted when its lowest point 
 export type Vec3 = [number, number, number];
 export type Robot = ReturnType<typeof createRobot>;
 
-// Objects come from a fixed pool in scene_web.xml (box0 to box5, ball0 to ball5), so the
+// Objects come from a fixed pool in scene_web.xml (box0 to box5, ball0 to ball5, and one container), so the
 // scene can change without recompiling: unused ones wait below the floor with collisions off.
-export type Kind = "box" | "ball";
-export const POOL = 6; // objects of each kind
+export type Kind = "box" | "ball" | "container";
+export const POOL = 6; // boxes and balls of each kind
 export type Obj = {
   kind: Kind;
   label: string; // "Box 1"
   body: number;
-  geom: number;
+  geom: number; // the first geom; a container has five
+  geoms: number[];
   qpos: number;
   dof: number;
   bvh: number;
@@ -48,13 +49,16 @@ export type Obj = {
   order: number; // when it was added, so "the first box" is well defined
 };
 const DENSITY = 1000; // kg/m³: the 3 x 3 x 4 cm box weighs 36 g
-export const DEFAULT_SIZE: Record<Kind, Vec3> = { box: [0.015, 0.015, 0.02], ball: [0.02, 0.02, 0.02] };
+export const DEFAULT_SIZE: Record<Kind, Vec3> = { box: [0.015, 0.015, 0.02], ball: [0.02, 0.02, 0.02], container: [0.1, 0.1, 0.02] };
+// The container's walls: 0.6 cm thick, so its inside is 18.8 cm across. Its top is its walls' top.
+export const WALL = 0.006;
 export const SIZE_RANGE = [0.01, 0.04]; // half extents: 2 to 8 cm across, the smallest the jaws still hold
 // Grab limits, measured with scripted picks: the open jaws take a box side up to 6 cm, and fingers-down
 // reach needs a box at most 6 cm high. Balls of every size in range work: the jaws close around them.
 export const JAWS = 0.06;
 export const TALLEST = 0.06;
 const FIRST_BOX: [number, number, number] = [0.2, 0.08, 0]; // where the scene's first box starts
+const FIRST_CONTAINER: [number, number, number] = [0.02, -0.33, 0]; // and the container, on the right
 const PARKED = [0, 0, -1, 1, 0, 0, 0]; // unused objects: 1 m below the floor, collisions off
 const DRAG_LIFT = 0.004; // a dragged object floats 4 mm above the floor
 
@@ -124,30 +128,34 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     return [x + c * p[0] - s * p[1], y + s * p[0] + c * p[1], p[2]];
   };
 
-  const objects: Obj[] = (["box", "ball"] as const).flatMap((kind) =>
-    Array.from({ length: POOL }, (_, i) => {
-      const body = id(obj.mjOBJ_BODY, `${kind}${i}`);
-      const joint = model.body_jntadr[body];
-      return {
-        kind,
-        label: `${kind === "box" ? "Box" : "Ball"} ${i + 1}`,
-        body,
-        geom: model.body_geomadr[body] as number,
-        qpos: model.jnt_qposadr[joint] as number,
-        dof: model.jnt_dofadr[joint] as number,
-        bvh: model.body_bvhadr[body] as number,
-        size: [...DEFAULT_SIZE[kind]] as Vec3,
-        active: false,
-        home: [0, 0, 0] as [number, number, number],
-        order: 0,
-      };
-    }),
-  );
+  const entry = (kind: Kind, name: string, label: string): Obj => {
+    const body = id(obj.mjOBJ_BODY, name);
+    const joint = model.body_jntadr[body];
+    const first = model.body_geomadr[body] as number;
+    return {
+      kind,
+      label,
+      body,
+      geom: first,
+      geoms: Array.from({ length: model.body_geomnum[body] as number }, (_, k) => first + k),
+      qpos: model.jnt_qposadr[joint] as number,
+      dof: model.jnt_dofadr[joint] as number,
+      bvh: model.body_bvhadr[body] as number,
+      size: [...DEFAULT_SIZE[kind]] as Vec3,
+      active: false,
+      home: [0, 0, 0] as [number, number, number],
+      order: 0,
+    };
+  };
+  const objects: Obj[] = [
+    ...(["box", "ball"] as const).flatMap((kind) => Array.from({ length: POOL }, (_, i) => entry(kind, `${kind}${i}`, `${kind === "box" ? "Box" : "Ball"} ${i + 1}`))),
+    entry("container", "container0", "Container"),
+  ];
+  const byGeom = new Map(objects.flatMap((o) => o.geoms.map((g) => [g, o] as const)));
   // The robot's collision geoms (arm, chassis and wheels), which a new object must not land on.
   const armGeoms = Array.from({ length: model.ngeom }, (_, g) => g).filter(
-    (g) => model.geom_bodyid[g] > 0 && !objects.some((o) => o.geom === g) && (model.geom_contype[g] || model.geom_conaffinity[g]),
+    (g) => model.geom_bodyid[g] > 0 && !byGeom.has(g) && (model.geom_contype[g] || model.geom_conaffinity[g]),
   );
-  const byGeom = new Map(objects.map((o) => [o.geom, o]));
   const floor = id(obj.mjOBJ_GEOM, "floor");
   let added = 0;
   let dragged: { o: Obj; pose: number[] } | null = null;
@@ -265,12 +273,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   ];
   const collide = (o: Obj, on: boolean) => {
     const v = on ? 1 : 0;
-    model.geom_contype[o.geom] = model.geom_conaffinity[o.geom] = v;
+    for (const g of o.geoms) model.geom_contype[g] = model.geom_conaffinity[g] = v;
     model.body_contype[o.body] = model.body_conaffinity[o.body] = v;
   };
   // Size, bounds, mass and inertia together, then the constants that depend on mass.
   // setConst runs on the IK scratch data, so the live state is untouched.
   const setSize = (o: Obj, size: Vec3) => {
+    if (o.kind === "container") return; // one fixed size
     const [a, b, c] = (o.size = o.kind === "ball" ? [size[0], size[0], size[0]] : ([...size] as Vec3));
     model.geom_size.set(o.size, 3 * o.geom);
     model.geom_rbound[o.geom] = o.kind === "box" ? Math.hypot(a, b, c) : a;
@@ -394,12 +403,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       for (const o of objects) pin(o, o.active ? upright(o, ...o.home, 0.001) : PARKED);
       mujoco.mj_forward(model, data);
     },
-    // Back to the first scene: one 3 x 3 x 4 cm box.
-    resetScene() {
+    // Back to the first scene: one 3 x 3 x 4 cm box, and on the page the container too.
+    resetScene(container = false) {
       dragged = null;
       for (const o of objects) robot.remove(o);
       const box = robot.add("box")!;
       robot.place(box, ...FIRST_BOX);
+      if (container) robot.place(robot.add("container")!, ...FIRST_CONTAINER);
     },
 
     // Scene editing. Every change runs mj_forward, so the drawing and the facts follow at once.
@@ -413,6 +423,11 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       o.active = true;
       o.order = ++added;
       collide(o, true);
+      if (kind === "container") {
+        const { x, y } = robot.clearSpot(o, [0.4, 0.5, 0.6, 0.7]);
+        robot.place(o, x, y, 0);
+        return o;
+      }
       const { x, y, room } = robot.clearSpot(o);
       const tops = robot.active().map((other) => (other === o ? 0 : robot.object(other).top));
       robot.place(o, x, y, 0, room > 0 ? 0.02 : Math.max(...tops) + 0.01);
@@ -472,10 +487,10 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       return (x: number, y: number) => Math.min(...obstacles.map(([ox, oy, , r]) => Math.hypot(ox - x, oy - y) - r - robot.footprint(o)));
     },
     // A reachable spot with 1 cm to spare, going outward from the front of the arm, else the one with the most room.
-    clearSpot(o: Obj) {
+    clearSpot(o: Obj, rings = [0.2, 0.17, 0.23, 0.14, 0.26]) {
       const room = robot.roomFinder(o);
-      let best = { x: 0.2, y: 0, room: -Infinity };
-      for (const r of [0.2, 0.17, 0.23, 0.14, 0.26])
+      let best = { x: rings[0], y: 0, room: -Infinity };
+      for (const r of rings)
         for (let i = 0; i <= 10; i++) {
           const a = (i % 2 ? 1 : -1) * Math.ceil(i / 2) * 0.2; // 0, then ±0.2 rad outward to ±1
           const spot = { x: r * Math.cos(a), y: r * Math.sin(a), room: room(r * Math.cos(a), r * Math.sin(a)) };
@@ -498,14 +513,26 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     },
     // Radius of the circle it covers on the table, standing upright.
     footprint: (o: Obj) => (o.kind === "ball" ? o.size[0] : Math.hypot(o.size[0], o.size[1])),
-    // Jev's target: the selected object, else the first box, else the first object.
+    // In the container: its centre inside the walls, its lowest point under their top, not in the jaws.
+    inside(o: Obj, container: Obj) {
+      const a = robot.object(o);
+      const c = robot.object(container);
+      const [dx, dy] = [a.world[0] - c.world[0], a.world[1] - c.world[1]];
+      const yaw = c.yaw + base().yaw;
+      const lx = Math.cos(yaw) * dx + Math.sin(yaw) * dy;
+      const ly = -Math.sin(yaw) * dx + Math.cos(yaw) * dy;
+      const inner = container.size[0] - WALL;
+      return Math.abs(lx) < inner && Math.abs(ly) < inner && a.bottom < c.top && !robot.gripped(o);
+    },
+    // Jev's target: the selected object, else the first box, else the first object. Never the container.
     pickTarget(selected: Obj | null) {
-      const active = robot.active();
-      return selected?.active ? selected : (active.find((o) => o.kind === "box") ?? active[0] ?? null);
+      const active = robot.active().filter((o) => o.kind !== "container");
+      return selected?.active && selected.kind !== "container" ? selected : (active.find((o) => o.kind === "box") ?? active[0] ?? null);
     },
     // Why the arm cannot grab it, or null when it can.
     tooBig(o: Obj) {
       if (o.kind === "ball") return null;
+      if (o.kind === "container") return "it is the container, 20 cm across";
       if (2 * Math.min(o.size[0], o.size[1]) > JAWS + 1e-9) return `every side is over ${JAWS * 100} cm, wider than the open jaws`;
       if (2 * o.size[2] > TALLEST + 1e-9) return `over ${TALLEST * 100} cm high, out of reach from above`;
       return null;

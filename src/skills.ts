@@ -5,8 +5,8 @@
 //
 // Skills read the scene from the World (world.ts) and act through the robot: joint targets, the gripper and
 // the wheels. Numbers and geometry stay in code.
-import { CLOSED, GRIPPER, LIFTED, OPEN, REST, STEP, TURN, wrap, type Obj, type Robot, type Vec3 } from "./robot";
-import { clear, inReach, onTop, restingOn, toGo, type Subgoal, type Target } from "./plan";
+import { CLOSED, GRIPPER, LIFTED, OPEN, REST, STEP, TURN, WALL, wrap, type Obj, type Robot, type Vec3 } from "./robot";
+import { clear, inReach, intoTarget, onTop, restingOn, toGo, type Subgoal, type Target } from "./plan";
 import { MARGIN, armOf, clearance, floorMap, follow, goalsAround, goalsForMove, nearest, pivot, planPath, type FloorMap } from "./nav";
 import type { World } from "./world";
 
@@ -112,7 +112,8 @@ export async function carryAbove({ robot, stage }: Ctx, target: Target, turned =
   const below = o.pos[2] - o.bottom; // its centre above its lowest point
   const goal: Vec3 = [target.x - (c * d[0] - s * d[1]), target.y - (s * d[0] + c * d[1]), target.top + CARRY + below - d[2]];
   const tallest = Math.max(0, ...robot.active().filter((x) => x !== robot.focus).map((x) => robot.object(x).top));
-  const safe = Math.max(tip[2], goal[2], tallest + 0.02 + below - d[2]);
+  // Travel high enough that the load clears everything: its lowest point, the object or the jaw tips under a ball.
+  const safe = Math.max(tip[2], goal[2], tip[2] + tallest + 0.02 - Math.min(o.bottom, tip[2]));
   const up = safe - tip[2] > 0.005 ? line(robot, tip, [tip[0], tip[1], safe], TILT, yaw0) : [];
   const over = line(robot, [tip[0], tip[1], safe], [goal[0], goal[1], safe], TILT, yaw0, yaw0 + turn, up.at(-1), true);
   const down = safe - goal[2] > 0.005 ? line(robot, [goal[0], goal[1], safe], goal, TILT, yaw0 + turn, yaw0 + turn, over.at(-1)) : [];
@@ -133,9 +134,10 @@ export async function lowerToPlace({ robot, stage }: Ctx, target: Target) {
   const goal: Vec3 = [tip[0] + target.x - o.pos[0], tip[1] + target.y - o.pos[1], tip[2] - (o.bottom - target.top) - 0.005];
   const path = line(robot, tip, goal, TILT, yaw);
   const focus = robot.focus!;
+  // The first touch: the object on the target, or the jaws on it (a small ball sits above the jaw tips).
   const landed = () => {
     const t = robot.touching(focus);
-    return target.object ? t.others.has(target.object) : t.table;
+    return target.object ? t.others.has(target.object) || robot.touching(target.object).arm : t.table;
   };
   stage("physics");
   await robot.play(path, 1.2, 0.3, landed);
@@ -152,12 +154,19 @@ export async function releaseJaws({ robot, stage }: Ctx, target: Target) {
 }
 
 // Move the open jaws away from what they just let go of: 6 mm off the fixed jaw it still leans on, then out
-// sideways along the gap between the jaws, toward the arm's base, then up a little.
+// sideways along the gap between the jaws, toward the arm's base, then up a little. A ball was dropped from
+// above with the jaw tips on the target: the jaws rise straight up instead, so they drag nothing sideways.
 export async function retreat({ robot, stage }: Ctx) {
   stage("ik");
   const tip = robot.tcp();
   const o = robot.object();
   const yaw = robot.handYaw();
+  if (robot.focus!.kind === "ball") {
+    const up = line(robot, tip, [tip[0], tip[1], Math.max(tip[2], o.top) + 0.03], TILT, yaw);
+    stage("physics");
+    await robot.play(up, 1.0);
+    return clear(robot, robot.focus!) ? "Rose straight up, jaws clear." : "Rose, but the jaws are still around the ball.";
+  }
   const off: Vec3 = [tip[0] - 0.006 * Math.cos(yaw), tip[1] - 0.006 * Math.sin(yaw), tip[2]];
   let side: Vec3 = [-Math.sin(yaw), Math.cos(yaw), 0];
   if (side[0] * o.pos[0] + side[1] * o.pos[1] > 0) side = [-side[0], -side[1], 0];
@@ -192,7 +201,8 @@ export async function stow({ robot, stage }: Ctx) {
   const tallest = Math.max(0, ...(held ? robot.active() : near).filter((o) => o !== held).map((o) => robot.object(o).top));
   stage("ik");
   if (held) {
-    const up = Math.max(0.05, tallest + 0.02) - robot.object(held).bottom;
+    // The load's lowest point: the object, or the jaw tips under a small ball.
+    const up = Math.max(0.05, tallest + 0.02) - Math.min(robot.object(held).bottom, tip[2]);
     if (up < 0.005) return;
     const path = line(robot, tip, [tip[0], tip[1], tip[2] + up], TILT, robot.handYaw());
     stage("physics");
@@ -270,7 +280,7 @@ export async function goTo(ctx: Ctx, sub: DriveSub | Approach, opts: { avoid?: n
     ctx.path(path.points);
     stage("drive");
     const near = opts.preshape && preshape(ctx, opts.preshape, armOf(path.goal));
-    const r = await follow(robot, path, { ...how, signal, near: near ? { within: 0.15, run: near } : undefined });
+    const r = await follow(robot, path, { ...how, signal, near: near ? { within: 0.15, run: near } : undefined }, map);
     if (r.ok) return { ok: true, text: `${touched.length ? `Planned again after touching ${labels(touched)}. ` : ""}Drove ${cm(r.moved)} cm on a path of ${path.segments.length} ${path.segments.length === 1 ? "move" : "moves"}.` };
     if (signal.aborted) return { ok: false, text: "Stopped." };
     if (!r.bumped) {
@@ -385,13 +395,14 @@ export async function place(ctx: Ctx, sub: Place, variant: number, approach?: Ap
   // The target where it is now, from wherever the base ends up.
   const [wx, wy] = robot.toWorld([sub.target.x, sub.target.y, 0]);
   const fresh = (): Target => {
+    if (sub.target.into) return intoTarget(robot, sub.target.object!);
     if (sub.target.object) return onTop(robot, sub.target.object);
     const [x, y] = robot.toArm([wx, wy, 0]);
     return { ...sub.target, x, y };
   };
   if (!robot.gripped(o)) {
     // Gripped low, a box sets down on a high tower with less reach; gripped at its middle, it rides a drive steady.
-    const took = await pickToPlace(ctx, o, variant, approach, inReach(robot, [fresh().x, fresh().y]));
+    const took = await pickToPlace(ctx, o, variant, approach, !sub.target.into && inReach(robot, [fresh().x, fresh().y]));
     if (!took.ok) return took;
   } else if (variant >= 2 && approach) {
     const moved = await goTo(ctx, approach, { avoid: ctx.world.base().yaw });
@@ -401,6 +412,7 @@ export async function place(ctx: Ctx, sub: Place, variant: number, approach?: Ap
   }
   const target = fresh();
   if (!inReach(robot, [target.x, target.y])) return { ok: false, text: `Took ${o.label}. ${target.label} is out of reach from here.` };
+  if (target.into) return drop(ctx, o, target.object!);
   for (const [name, run] of [
     ["move_above_target", () => carryAbove(ctx, target, variant === 1)],
     ["lower_to_place", () => lowerToPlace(ctx, target)],
@@ -419,6 +431,52 @@ export async function place(ctx: Ctx, sub: Place, variant: number, approach?: Ap
   ctx.say("retreat", await retreat(ctx));
   return { ok: true, text: `Set ${o.label} on ${target.label}.` };
 }
+// Into the container: a free spot inside that the arm reaches, the object carried over the walls, lowered to just
+// above what is under it, let go, and the jaws raised straight up.
+async function drop(ctx: Ctx, o: Obj, container: Obj): Promise<Outcome> {
+  const { robot } = ctx;
+  const spot = dropSpot(robot, o, container);
+  if (!spot) return { ok: false, text: "No spot inside the container is in the arm's reach from here." };
+  const target: Target = { label: "the container", x: spot[0], y: spot[1], top: spot[2] + 0.01, yaw: null, object: container, into: true };
+  for (const [name, run] of [
+    ["move_above_target", () => carryAbove(ctx, target)],
+    ["lower_to_place", () => lowerToPlace(ctx, target)],
+  ] as const) {
+    if (ctx.signal.aborted) return { ok: false, text: "Stopped." };
+    const text = await run();
+    ctx.say(name, text.replace(/Set down on the container.*|Lowered, .*/, "Lowered into the container."));
+    if (/Dropped/.test(text)) return { ok: false, text };
+  }
+  ctx.stage("physics");
+  await robot.play([[...robot.target.slice(0, GRIPPER), OPEN]], 0.6, 0.4);
+  ctx.say("release", robot.inside(o, container) ? `Let go. ${o.label} is in the container.` : `Let go. ${o.label} is not in the container.`);
+  await raise(ctx);
+  ctx.say("retreat", "Rose straight up.");
+  return robot.inside(o, container) ? { ok: true, text: `Put ${o.label} in the container.` } : { ok: false, text: `${o.label} did not land in the container.` };
+}
+
+// A spot inside the container for `o`, in the arm's frame, with the height of what is under it: at least 2 cm
+// from the walls, in the arm's reach, clear of what is already inside, nearest where the arm reaches best. When
+// nothing inside is clear, on top of what is lowest.
+function dropSpot(robot: Robot, o: Obj, container: Obj): Vec3 | null {
+  const c = robot.object(container);
+  const [cs, sn] = [Math.cos(c.yaw), Math.sin(c.yaw)];
+  const half = container.size[0] - WALL - robot.footprint(o) - 0.02;
+  const inside = robot.active().filter((x) => x !== o && x !== container && robot.inside(x, container));
+  let best: { p: Vec3; score: number } | null = null;
+  for (let u = -half; u <= half + 1e-9; u += 0.01)
+    for (let v = -half; v <= half + 1e-9; v += 0.01) {
+      const x = c.pos[0] + cs * u - sn * v;
+      const y = c.pos[1] + sn * u + cs * v;
+      if (!inReach(robot, [x, y])) continue;
+      const under = inside.filter((i) => Math.hypot(robot.object(i).pos[0] - x, robot.object(i).pos[1] - y) < robot.footprint(i) + robot.footprint(o) + 0.005);
+      const top = Math.max(c.bottom + 0.004, ...under.map((i) => robot.object(i).top));
+      const score = Math.hypot(x - 0.2, y) + (under.length ? 1 + top : 0);
+      if (!best || score < best.score) best = { p: [x, y, top], score };
+    }
+  return best?.p ?? null;
+}
+
 // The pick inside a place: grip a box low when it goes on something in reach, so the arm reaches less high.
 async function pickToPlace(ctx: Ctx, o: Obj, variant: number, approach?: Approach, low = true) {
   const { robot } = ctx;
@@ -460,8 +518,9 @@ export function versus(robot: Robot, o: Obj, target: Target) {
   const held = touch.fixed && touch.moving;
   const down = held ? gap > -0.006 && gap < 0.003 : Math.abs(gap) < 0.006 && (t ? touch.others.has(t) : touch.table);
   const sitting = a.upright && off < reach && down;
-  // Close enough to let go: centred, and within 6 mm of the target's top, even a little tilted in the jaws.
-  const close = off < reach && gap > -0.006 && gap < 0.006;
+  // Close enough to let go: centred, and within 6 mm of the target's top, even a little tilted in the jaws. A
+  // ball sits above the jaw tips, so they touch the target first: it drops the last few cm.
+  const close = off < reach && gap > -0.006 && gap < (o.kind === "ball" ? 0.045 : 0.006);
   return { sitting, close, above: !sitting && off < reach && gap > 0, off, gap };
 }
 

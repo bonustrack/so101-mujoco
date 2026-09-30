@@ -292,7 +292,7 @@ const STAGE_TEXT: Record<string, string> = {
 };
 const SKILL_TEXT: Record<string, string> = { drive: "Drive", pick: "Pick", place: "Place" };
 const BASE_ACTIONS = ["drive", "drive_to_object", "back_off"];
-const DONE_TEXT: Record<string, string> = { take: "Lifted.", stack_boxes: "Stacked.", stack_all: "Stacked.", put_on: "Placed.", drive: "Moved.", drive_to: "Arrived." };
+const DONE_TEXT: Record<string, string> = { take: "Lifted.", stack_boxes: "Stacked.", stack_all: "Stacked.", put_on: "Placed.", put_in: "In the container.", fill: "Filled.", drive: "Moved.", drive_to: "Arrived." };
 const END_TEXT: Record<Extract<AgentEvent, { type: "end" }>["outcome"], string> = {
   success: "Done.",
   done: "Not done.",

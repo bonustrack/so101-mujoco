@@ -32,17 +32,22 @@ type Circle = { x: number; y: number; r: number; top: number; obj: Obj; soft: bo
 // A part that sticks out of the chassis outline, in the pivot's frame: it only meets obstacles taller than
 // `above`.
 type Part = { x: number; y: number; r: number; above: number };
-export type FloorMap = { circles: Circle[]; parts: Part[]; margin: number };
+// The container as the rectangle it covers on the floor: the chassis drives around it, the load passes over it.
+type Rect = { x: number; y: number; yaw: number; hx: number; hy: number; top: number; obj: Obj };
+export type FloorMap = { circles: Circle[]; rects: Rect[]; parts: Part[]; margin: number };
 
 // What stands on the floor now, from the world: every object but the one in the jaws. The folded jaws, 12 cm
-// up and 15 cm ahead, only meet a tower; an object in the jaws meets what stands higher than its bottom.
+// up and 15 cm ahead, only meet a tower; an object in the jaws meets what stands higher than its bottom, or
+// than the jaw tips when they hang below it.
 export function floorMap(world: World, soft: Obj[] = [], margin = MARGIN): FloorMap {
   const seen = world.objects();
   const held = seen.find((o) => o.held);
-  const circles = seen.flatMap((o) => (o === held ? [] : [{ x: o.world[0], y: o.world[1], r: o.footprint, top: o.top, obj: o.obj, soft: soft.includes(o.obj) }]));
+  const base = world.base().yaw;
+  const circles = seen.flatMap((o) => (o === held || o.kind === "container" ? [] : [{ x: o.world[0], y: o.world[1], r: o.footprint, top: o.top, obj: o.obj, soft: soft.includes(o.obj) }]));
+  const rects = seen.flatMap((o) => (o.kind === "container" ? [{ x: o.world[0], y: o.world[1], yaw: o.yaw + base, hx: o.size[0], hy: o.size[1], top: o.top, obj: o.obj }] : []));
   const parts: Part[] = [{ x: 0.15 - PIVOT, y: 0, r: 0.03, above: 0.115 }];
-  if (held) parts.push({ x: held.pos[0] - PIVOT, y: held.pos[1], r: held.footprint, above: held.bottom - 0.01 });
-  return { circles, parts, margin };
+  if (held) parts.push({ x: held.pos[0] - PIVOT, y: held.pos[1], r: held.footprint, above: Math.min(held.bottom, world.jaws()[2]) - 0.01 });
+  return { circles, rects, parts, margin };
 }
 
 // The gap between the robot with its pivot at `c` and the nearest obstacle; negative when they overlap.
@@ -65,15 +70,58 @@ export function clearance(map: FloorMap, c: Pose) {
       gap = Math.min(gap, Math.hypot(lx - p.x, ly - p.y) - p.r - o.r);
     }
   }
+  if (!map.rects.length) return gap;
+  const body: Rect = { x: c.x + CX * cs, y: c.y + CX * sn, yaw: c.yaw, hx: HALF_L, hy: HALF_W, top: 0, obj: null as unknown as Obj };
+  for (const r of map.rects) {
+    gap = Math.min(gap, rectGap(body, r));
+    for (const p of map.parts) if (r.top > p.above) gap = Math.min(gap, pointGap(c.x + cs * p.x - sn * p.y, c.y + sn * p.x + cs * p.y, r) - p.r);
+  }
   return gap;
+}
+
+// A point's distance to a rectangle, negative inside.
+function pointGap(px: number, py: number, r: Rect) {
+  const [c, s] = [Math.cos(r.yaw), Math.sin(r.yaw)];
+  const lx = c * (px - r.x) + s * (py - r.y);
+  const ly = -s * (px - r.x) + c * (py - r.y);
+  const qx = Math.abs(lx) - r.hx;
+  const qy = Math.abs(ly) - r.hy;
+  return qx > 0 || qy > 0 ? Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) : Math.max(qx, qy);
+}
+const cornersOf = (r: Rect) =>
+  [
+    [1, 1],
+    [1, -1],
+    [-1, -1],
+    [-1, 1],
+  ].map(([i, j]) => [r.x + i * r.hx * Math.cos(r.yaw) - j * r.hy * Math.sin(r.yaw), r.y + i * r.hx * Math.sin(r.yaw) + j * r.hy * Math.cos(r.yaw)]);
+// The gap between two rectangles: negative, by how deep, when they overlap (separating axes), else the nearest
+// corner of one to the other.
+function rectGap(a: Rect, b: Rect) {
+  const ca = cornersOf(a);
+  const cb = cornersOf(b);
+  let overlap = Infinity;
+  for (const t of [a.yaw, a.yaw + Math.PI / 2, b.yaw, b.yaw + Math.PI / 2]) {
+    const [u, v] = [Math.cos(t), Math.sin(t)];
+    const pa = ca.map(([x, y]) => x * u + y * v);
+    const pb = cb.map(([x, y]) => x * u + y * v);
+    const o = Math.min(Math.max(...pa), Math.max(...pb)) - Math.max(Math.min(...pa), Math.min(...pb));
+    if (o <= 0) return Math.min(...ca.map(([x, y]) => pointGap(x, y, b)), ...cb.map(([x, y]) => pointGap(x, y, a)));
+    overlap = Math.min(overlap, o);
+  }
+  return -overlap;
 }
 // The obstacle nearest the robot at `c`.
 export function nearest(map: FloorMap, c: Pose) {
-  let best: Circle | null = null;
+  let best: { obj: Obj } | null = null;
   let gap = Infinity;
   for (const o of map.circles) {
-    const g = clearance({ ...map, circles: [o] }, c);
+    const g = clearance({ ...map, circles: [o], rects: [] }, c);
     if (g < gap) [best, gap] = [o, g];
+  }
+  for (const r of map.rects) {
+    const g = clearance({ ...map, circles: [], rects: [r] }, c);
+    if (g < gap) [best, gap] = [r, g];
   }
   return best;
 }
@@ -270,7 +318,8 @@ export function goalsAround(map: FloorMap, x: number, y: number, distance: numbe
   for (let h = 0; h < HEADINGS; h++) {
     const yaw = from + h * DH;
     const c = pivot({ x: x - distance * Math.cos(yaw), y: y - distance * Math.sin(yaw), yaw });
-    if (clearance(map, c) < map.margin) continue;
+    const room = clearance(map, c);
+    if (room < map.margin) continue;
     // Others next to it on the robot's side are in the way of the arm.
     let cost = 0;
     for (const o of map.circles) {
@@ -279,7 +328,8 @@ export function goalsAround(map: FloorMap, x: number, y: number, distance: numbe
       const side = Math.abs(-(o.x - x) * Math.sin(yaw) + (o.y - y) * Math.cos(yaw));
       if (along > -0.02 && along < distance && side < o.r + 0.05) cost += 1.5;
     }
-    goals.push({ ...c, cost });
+    // A little more room than the margin, where there is: the robot ends a path within a few cm of it.
+    goals.push({ ...c, cost: cost + (room < map.margin + 0.01 ? 1 : 0) });
   }
   return goals;
 }
@@ -347,7 +397,7 @@ function legs(start: Pose, segments: Segment[]): Leg[] {
 // path, as fast as the path left allows, slowing to stop at its end. Turns on the spot use the base's own
 // turn. At the end it drives what is left along its heading and turns to the goal's heading. It stops at the
 // first touch, and when it makes no progress for 2 s.
-export async function follow(robot: Robot, path: Path, drive: Drive): Promise<Drove> {
+export async function follow(robot: Robot, path: Path, drive: Drive, map?: FloorMap): Promise<Drove> {
   let moved = 0;
   let near = drive.near;
   const all = legs(pivot(robot.base()), path.segments);
@@ -367,15 +417,18 @@ export async function follow(robot: Robot, path: Path, drive: Drive): Promise<Dr
     if (!r.ok) return { ...r, moved };
   }
   near?.run();
+  // The last few cm: along its heading, then the goal's heading, each only where it keeps 1 cm clear.
   const c = pivot(robot.base());
   const along = (path.goal.x - c.x) * Math.cos(c.yaw) + (path.goal.y - c.y) * Math.sin(c.yaw);
-  if (Math.abs(along) > 0.004) {
+  const room = (p: Pose) => !map || clearance(map, p) >= 0.01;
+  if (Math.abs(along) > 0.004 && room({ x: c.x + along * Math.cos(c.yaw), y: c.y + along * Math.sin(c.yaw), yaw: c.yaw })) {
     const r = await robot.move("drive", along);
     moved += Math.abs(r.moved);
     if (r.bumped) return { ok: false, bumped: r.bumped, moved };
   }
   const d = wrap(path.goal.yaw - robot.base().yaw);
-  if (Math.abs(d) > 0.01) {
+  const e = pivot(robot.base());
+  if (Math.abs(d) > 0.01 && [0.5, 1].every((k) => room({ ...e, yaw: e.yaw + k * d }))) {
     const r = await robot.move("turn", d);
     if (r.bumped) return { ok: false, bumped: r.bumped, moved };
   }

@@ -5,7 +5,8 @@ The SO-101 robot arm on a wheeled base, simulated live in the browser with MuJoC
 - Drag to orbit, scroll or pinch to zoom. The view follows the base.
 - One slider per joint drives the arm's position actuators. The number next to each slider is the joint's actual angle.
 - Preset poses: rest, reach forward, reach right, reach up. Reset puts the arm, the base and the objects back.
-- A 3 x 3 x 4 cm box sits on the floor within reach of a top-down grasp.
+- A 3 x 3 x 4 cm box sits on the floor within reach of a top-down grasp, and a large open container (20 x 20 cm, 4 cm high) on the robot's right.
+- Scene: add boxes, balls and the container, drag them, resize boxes and balls, delete any of them.
 
 ## The wheeled base
 
@@ -34,7 +35,8 @@ The panel lets [Jev](https://docs.typesafe.ai) (TypeSafe AI's System One model) 
 - Take one object: "Take the box", "lift the ball", "grab Box 2". The goal wins over the selection: the selected object only fills in "it" or "this".
 - Stack the boxes: "Stack all the boxes together". Biggest at the bottom unless the goal asks otherwise.
 - Stack everything: boxes, then one ball on top (nothing stays on a ball).
-- Put one object on another: "Put Box 2 on Box 1".
+- Put one object on another: "Put Box 2 on Box 1". A ball goes on a box too: the jaw tips reach the box first, so the ball is let go the last few cm above it.
+- The container: "put the ball in the container", "fill the container with the balls", "put all the boxes in the container", "fill the container". Each object is dropped at a free spot inside that the arm reaches.
 - Drive or turn: "go forward", "drive back 20 cm", "turn left", "turn around". Distances snap to 10, 20, 30, 50 cm or 1 m, angles to 15, 30, 45, 90 or 180°.
 - Drive up to an object: "go to Box 2". Taking, stacking and putting drive by themselves when what they need is out of reach: "drive to the ball and pick it up".
 
@@ -47,7 +49,7 @@ Jev is a decision model, not a chat model: it answers typed questions and does n
 3. Skills. Code runs each step with a skill (`src/skills.ts`), checked as it goes:
    - Drive: a path around everything, see "Driving for a task". While it drives the last 15 cm up to an object to take, the arm rises above where the object will be, so the pick starts sooner.
    - Pick: open the jaws, hover, lower around the object, close, check both jaws hold it and the gripper did not shut on nothing, lift.
-   - Place: pick the object if it is not in the jaws, carry it over the target (around the arm's base, turned square to a box below), lower it until it touches, let go once it sits there, slide the jaws out sideways.
+   - Place: pick the object if it is not in the jaws, carry it over the target (around the arm's base, turned square to a box below), lower it until it or the jaws touch, let go once it sits there, slide the jaws out sideways (after a ball: straight up). Into the container: a free spot inside, at least 2 cm from the walls and in reach, carried over the walls, let go 1 cm above the floor or what is under it.
    Code solves the joint angles with damped least squares inverse kinematics on `mj_jacSite` (fingers pointing down, tilted only as much as a high target needs) and MuJoCo runs the motion.
 4. Check. Code decides when a step is done: an object taken is 5 cm up in both jaws for 1 s; an object placed rests on its target, let go, jaws clear, still for 0.5 s. A tower counts once every box is on it and it stands for 1 s. A move is done within 1 cm or 2°.
 5. Watch progress. A step that fails is tried another way, each way once: a pick with the jaws turned 90°, then from another side of the object; a place landing a quarter turn around, then from another side; a drive backing off 10 cm first. When no way is left, one Jev call chooses: try once more, leave this object out (one box of a tower), or stop. The run then ends saying why. A task also stops after 60 s of motion plus 20 s per object.

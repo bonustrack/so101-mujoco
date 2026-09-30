@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import type { Decide, JevResponse } from "../src/agent";
 import { createRobot, loadModel } from "../src/robot";
 import jevFunction from "../netlify/functions/jev";
-import { createBench, gate, report, summarize, type Mode, type Record } from "./bench-core";
+import { createBench, gate, report, seedFor, summarize, type Mode, type Record } from "./bench-core";
 
 const arg = (name: string, fallback: string) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -37,8 +37,8 @@ async function worker(k: number, n: number, out: string) {
   const jev = MODE === "jev" ? jevDecider() : undefined;
   const total = families.length * SEEDS;
   for (let i = k; i < total; i += n) {
-    const family = families[i % families.length];
-    const record = await bench.run(family, SEED0 + i, MODE, jev);
+    const { family, seed } = seedFor(families, i, SEED0);
+    const record = await bench.run(family, seed, MODE, jev);
     appendFileSync(out, JSON.stringify(record) + "\n");
     console.log(`${record.clean ? "clean" : record.success ? "dirty" : "FAIL "} ${family} #${record.seed} "${record.goal}" ${record.outcome} ${record.taskSeconds}s ${record.calls} calls | ${record.events.map((e) => e.kind).join(",")}`);
   }
@@ -91,7 +91,7 @@ for (const part of parts) {
   for (const line of text.split("\n")) if (line) records.push(JSON.parse(line));
   rmSync(part, { force: true });
 }
-records.sort((a, b) => a.seed - b.seed);
+records.sort((a, b) => a.seed - b.seed || a.family.localeCompare(b.family));
 writeFileSync(OUT, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
 const summary = summarize(records);
 console.log(`\n${MODE} decider, ${records.length} runs in ${((performance.now() - started) / 1000).toFixed(0)} s on ${JOBS} cores. Runs: ${OUT}\n`);

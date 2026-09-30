@@ -134,7 +134,7 @@ export async function runAgent(options: {
       const failed = tried.get(sub.text) ?? [];
       if (failed.length >= HOW[skill].length) {
         // 3. Code has no way left: Jev chooses.
-        const canSkip = task.kind === "stack" && sub.kind === "place" && task.objects.indexOf(sub.object) > 0 && task.objects.length > 2;
+        const canSkip = sub.kind === "place" && ((task.kind === "stack" && task.objects.indexOf(sub.object) > 0 && task.objects.length > 2) || (task.kind === "put_in" && task.objects.length > 1));
         const request: JevRequest = {
           model,
           state: { goal, step: sub.text, tried: failed, steps_left: current.steps.filter((s) => !s.done && s.text !== sub.text).map((s) => s.text), already_retried: retried.has(sub.text) ? "yes" : "no" },
@@ -148,7 +148,7 @@ export async function runAgent(options: {
         if (answer.choice === "retry" && !retried.has(sub.text)) {
           retried.add(sub.text);
           tried.set(sub.text, []);
-        } else if (answer.choice === "skip" && task.kind === "stack" && sub.kind === "place") {
+        } else if (answer.choice === "skip" && (task.kind === "stack" || task.kind === "put_in") && sub.kind === "place") {
           task.objects = task.objects.filter((o) => o !== sub.object);
           task.skipped.push(`${sub.object.label} left out: ${failed.at(-1)}`);
           current = plan(robot, task);
@@ -238,6 +238,7 @@ async function checkPlace(robot: Robot, task: Task, sub: Place) {
     return !!now?.done;
   };
   if (!achieved()) {
+    if (sub.target.into) return { success: false, text: `${o.label} is not in the container.` };
     const v = versus(robot, o, sub.target);
     const held = robot.touching(o);
     const text =
@@ -251,7 +252,8 @@ async function checkPlace(robot: Robot, task: Task, sub: Place) {
     return { success: false, text };
   }
   await robot.hold(0.5);
-  if (!achieved() || robot.speed(o) > 0.01) return { success: false, text: `${o.label} did not stay on ${sub.target.label}.` };
+  if (!achieved() || robot.speed(o) > 0.01) return { success: false, text: `${o.label} did not stay ${sub.target.into ? "in" : "on"} ${sub.target.label}.` };
+  if (sub.target.into) return { success: true, text: `${o.label} is in the container, still after 0.5 s.` };
   const v = versus(robot, o, sub.target);
   return { success: true, text: `${o.label} sits on ${sub.target.label}, ${cm(v.off)} cm off centre, still after 0.5 s.` };
 }
@@ -268,6 +270,10 @@ async function checkAll(robot: Robot, task: Task) {
     return { success: true, text: `${task.objects.length} objects stacked, ${cm(top)} cm tall, standing for 1 s.${task.skipped.length ? " " + task.skipped.join(" ") : ""}` };
   }
   if (task.kind === "drive") return { success: true, text: baseMoved(robot, task.drive) };
+  if (task.kind === "put_in") {
+    const n = task.objects.length;
+    return { success: true, text: `${n === 1 ? `${task.objects[0].label} is` : `${n} objects are`} in the container, still for 1 s.${task.skipped.length ? " " + task.skipped.join(" ") : ""}` };
+  }
   if (task.kind === "drive_to") {
     const { r } = robot.polar(robot.object(task.object).pos);
     return { success: true, text: `${task.object.label} is in reach, ${cm(r)} cm from the arm.` };

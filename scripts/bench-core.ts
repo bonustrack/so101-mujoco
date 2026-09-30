@@ -17,7 +17,7 @@ export type Mode = "rules" | "jev";
 // so both modes estimate what the page shows.
 export const RULES_LATENCY = 0.2;
 
-type Spec = { kind: "box" | "ball"; x: number; y: number; yaw: number; size: Vec3 };
+type Spec = { kind: "box" | "ball" | "container"; x: number; y: number; yaw: number; size: Vec3 };
 type Truth = { task: string; picks: Record<string, string> };
 // A scene, a goal, the true reading, and which objects the task may move.
 type Case = { family: string; goal: string; truth: Truth; objs: Obj[]; target?: Obj; selected?: Obj | null; moves: Obj[] };
@@ -32,7 +32,7 @@ export function createBench(robot: Robot) {
   const objectGeoms = new Map(robot.objects.map((o) => [o.geom, o]));
   const floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM.value, "floor");
   const geomKind = (g: number) => (objectGeoms.has(g) ? "object" : g === floor ? "floor" : baseBodies.has(model.geom_bodyid[g]) ? "base" : "arm");
-  const chassisDof = model.jnt_dofadr[model.body_jntadr[chassis]] as number;
+  const EQUALITY = mujoco.mjtDisableBit.mjDSBL_EQUALITY.value;
 
   // Seeded random, reset per run, so a run is the same whatever ran before it.
   let seed = 1;
@@ -52,11 +52,12 @@ export function createBench(robot: Robot) {
     const inside = s.x < 0.08 + m && s.x > -0.13 - m && Math.abs(s.y) < 0.095 + m;
     return !inside && others.every((o) => Math.hypot(o.x - s.x, o.y - s.y) > foot(o) + foot(s) + 0.035);
   };
-  function spot(kind: "box" | "ball", others: Spec[], r: [number, number], a: [number, number]): Spec {
+  function spot(kind: Spec["kind"], others: Spec[], r: [number, number], a: [number, number]): Spec {
     for (let i = 0; i < 200; i++) {
       const rr = uni(...r);
       const aa = uni(...a);
-      const s: Spec = { kind, x: rr * Math.cos(aa), y: rr * Math.sin(aa), yaw: uni(-1.5, 1.5), size: kind === "box" ? boxSize() : ballSize() };
+      const size: Vec3 = kind === "box" ? boxSize() : kind === "ball" ? ballSize() : [0.1, 0.1, 0.02];
+      const s: Spec = { kind, x: rr * Math.cos(aa), y: rr * Math.sin(aa), yaw: uni(-1.5, 1.5), size };
       if (fits(s, others)) return s;
     }
     throw new Error("no spot");
@@ -65,9 +66,10 @@ export function createBench(robot: Robot) {
   const FAR: [[number, number], [number, number]] = [[0.35, 0.9], [-Math.PI, Math.PI]];
 
   function build(specs: Spec[]) {
+    robot.reset();
     robot.resetScene();
     robot.reset();
-    robot.remove(robot.active()[0]);
+    for (const o of robot.active()) robot.remove(o);
     const objs = specs.map((s) => {
       const o = robot.add(s.kind)!;
       robot.resize(o, s.size);
@@ -171,6 +173,22 @@ export function createBench(robot: Robot) {
       const t = pick(objs);
       return { family: "drive_to", goal: `go to ${t.label}`, truth: { task: "drive_to", picks: { object: t.label } }, objs, target: t, moves: [] };
     },
+    // Put one object in the container, somewhere around.
+    container_put() {
+      const specs: Spec[] = [spot("container", [], [0.4, 0.65], [-Math.PI, Math.PI])];
+      const n = 2 + Math.floor(random() * 2);
+      for (let i = 0; i < n; i++) specs.push(spot(random() < 0.5 ? "box" : "ball", specs, [0.3, 0.8], [-Math.PI, Math.PI]));
+      const objs = build(specs);
+      const t = objs[1 + Math.floor(random() * n)];
+      return { family: "container_put", goal: `put ${t.label} in the container`, truth: { task: "put_in", picks: { object: t.label } }, objs, target: t, moves: [t] };
+    },
+    // Fill the container with the balls, a box around too.
+    container_fill() {
+      const specs: Spec[] = [spot("container", [], [0.4, 0.65], [-Math.PI, Math.PI])];
+      for (const k of ["ball", "ball", "ball", "box"] as const) specs.push(spot(k, specs, [0.25, 0.75], [-Math.PI, Math.PI]));
+      const objs = build(specs);
+      return { family: "container_fill", goal: pick(["fill the container with the balls", "put all the balls in the container"]), truth: { task: "fill", picks: { which: "balls" } }, objs, moves: objs.filter((o) => o.kind === "ball") };
+    },
   };
   const families = Object.keys(FAMILY);
 
@@ -225,8 +243,8 @@ export function createBench(robot: Robot) {
         thinking = false;
       }
     };
-    // The base moves when the chassis does: the brake holds it still otherwise. What it pushes while moving
-    // counts from the start of each move to its end.
+    // The base drives while its brake is off (robot.ts turns it off for every move). What it pushes while
+    // driving counts from the start of each move to its end.
     let moving = false;
     let still = 0;
     let atMove = start;
@@ -238,7 +256,8 @@ export function createBench(robot: Robot) {
     const simStart = data.time;
     const cpu0 = performance.now();
     let finished = false;
-    const task = runAgent({ robot, goal: c.goal, model: "jev-latest", decide, signal: controller.signal, onEvent: (e) => events.push(e), selected: c.selected ?? null }).finally(() => (finished = true));
+    const trace = process.env.BENCH_TRACE ? (e: AgentEvent) => (e.type === "skill" || e.type === "result" || e.type === "check") && console.log(`  t=${data.time.toFixed(2)} ${e.type} ${"text" in e ? e.text : `${e.subgoal} #${e.attempt}`}`) : () => {};
+    const task = runAgent({ robot, goal: c.goal, model: "jev-latest", decide, signal: controller.signal, onEvent: (e) => (events.push(e), trace(e)), selected: c.selected ?? null }).finally(() => (finished = true));
     while (!finished) {
       if (thinking) {
         await new Promise((r) => setTimeout(r, 2));
@@ -251,9 +270,7 @@ export function createBench(robot: Robot) {
         const R = data.xmat.subarray(9 * chassis, 9 * chassis + 9);
         const tilt = (Math.acos(Math.min(1, R[8])) * 180) / Math.PI;
         maxTilt = Math.max(maxTilt, tilt);
-        const v = Math.hypot(data.qvel[chassisDof], data.qvel[chassisDof + 1]);
-        const w = Math.abs(data.qvel[chassisDof + 5]);
-        if (v > 0.005 || w > 0.03) {
+        if (model.opt.disableflags & EQUALITY) {
           if (!moving) atMove = snap();
           moving = true;
           still = 0;
@@ -269,7 +286,7 @@ export function createBench(robot: Robot) {
           const [g1, g2] = [ct.geom1, ct.geom2];
           ct.delete();
           const o = objectGeoms.get(g1) ?? objectGeoms.get(g2);
-          if (!o || !o.active || robot.gripped(o)) continue;
+          if (!o || !o.active || carried(o)) continue;
           const kind = geomKind(objectGeoms.has(g1) ? g2 : g1);
           if (kind !== "base" && kind !== "arm") continue;
           const key = `${o.label}:${kind}`;
@@ -296,9 +313,16 @@ export function createBench(robot: Robot) {
     return finish({ c, mode, runSeed, events, evs, start, calls, inputTokens, sim: data.time - simStart, jevMs, cpuMs: performance.now() - cpu0 - jevMs, maxTilt });
   }
 
-  // Every active object's world position, whether the jaws hold it, and whether it stands upright.
+  // Every active object's world position, whether the jaws carry it, and whether it stands upright.
   function snap() {
-    return new Map(robot.active().map((o) => [o, { p: robot.object(o).world, held: robot.gripped(o), upright: robot.object(o).upright }]));
+    return new Map(robot.active().map((o) => [o, { p: robot.object(o).world, held: carried(o), upright: robot.object(o).upright }]));
+  }
+  // In the jaws, or lifted right at them: a grip contact can flicker for a step while it rides along.
+  function carried(o: Obj) {
+    if (robot.gripped(o)) return true;
+    const a = robot.object(o);
+    const tip = robot.tcp();
+    return a.bottom > 0.01 && Math.hypot(a.pos[0] - tip[0], a.pos[1] - tip[1], a.pos[2] - tip[2]) < 0.06;
   }
   // How far each object not held now or then moved since `then`.
   function moved(then: ReturnType<typeof snap>) {
@@ -364,6 +388,16 @@ export function createBench(robot: Robot) {
   return { families, run };
 }
 
+// A run's seed: the 12 first families keep the seeds they had before the container came, so their scenes stay the
+// same from phase to phase; the container families get their own.
+export function seedFor(families: string[], i: number, seed0: number) {
+  const f = families[i % families.length];
+  const k = Math.floor(i / families.length);
+  const all = ["near_take_ball", "near_take_ball_selected", "near_take_named", "near_stack", "near_put", "far_take", "blocked_take", "far_put", "spread_stack", "turn_clutter", "forward_blocked", "drive_to", "container_put", "container_fill"];
+  const at = all.indexOf(f);
+  return { family: f, seed: at < 12 ? seed0 + k * 12 + at : seed0 + 5000 + k * 2 + (at - 12) };
+}
+
 const round = (x: number) => Math.round(x * 10) / 10;
 
 // The most times one step failed the same way in a run: a try failed when the next try of that step is the
@@ -389,6 +423,8 @@ function readingMatches(text: string, c: Case) {
   if (t.task === "stack_boxes") return text.startsWith("Stack ");
   if (t.task === "drive_to") return text.startsWith(`Drive up to ${t.picks.object}`);
   if (t.task === "drive") return t.picks.angle === "180_deg" ? /Turn left 180/.test(text) : /Drive forward 50 cm/.test(text);
+  if (t.task === "put_in") return text.startsWith(`Put ${t.picks.object} in the container`);
+  if (t.task === "fill") return c.moves.every((o) => text.includes(o.label)) && c.objs.filter((o) => !c.moves.includes(o)).every((o) => !text.includes(`${o.label},`) && !text.includes(`${o.label} in`));
   return true;
 }
 
@@ -458,7 +494,7 @@ export const TARGETS = {
   container: 90, // % success
 };
 // The floor each phase ships on: raised as the phases land.
-export const GATE = { clean: 95, wrongObject: 100, noBaseTouch: 98, maxTilt: 5, callsMedian: 1, callsP90: 2 };
+export const GATE = { clean: 95, wrongObject: 100, noBaseTouch: 98, maxTilt: 5, callsMedian: 1, callsP90: 2, container: 90 };
 
 export function gate(s: Summary, floor: { [k: string]: number } = GATE) {
   const fails: string[] = [];

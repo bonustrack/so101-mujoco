@@ -10,7 +10,10 @@
      so the page can add, move, resize and remove them without recompiling the model.
      src/robot.ts hides the unused ones below the floor with collisions off, and sets each
      object's size, mass and inertia at runtime (density 1000 kg/m³). At first only box0
-     is out: a 3 x 3 x 4 cm box of 36 g on the floor where a top-down grasp reaches it. -->
+     is out: a 3 x 3 x 4 cm box of 36 g on the floor where a top-down grasp reaches it.
+     One large open container (container0), 20 x 20 cm and 4 cm high, 0.6 cm walls on a 0.4 cm floor, 400 g:
+     the page puts it out with the first box, and the arm fills it with boxes and balls. Its frame sits at
+     mid-height, like a box's. -->
 <mujoco model="so101 web">
   <compiler angle="radian" autolimits="true"/>
   <!-- The arm's own simulation settings: an attached model brings its bodies, not its options. -->
@@ -78,6 +81,14 @@
           solref="0.01 1"/>
       </body>
     </replicate>
+    <body name="container0" pos="0.35 -0.35 0.02">
+      <freejoint/>
+      <geom type="box" name="container_floor" size="0.1 0.1 0.002" pos="0 0 -0.018" mass="0.2" condim="3" friction="1 .03 .003" rgba="0.55 0.62 0.58 1" solref="0.01 1"/>
+      <geom type="box" name="container_left" size="0.1 0.003 0.02" pos="0 0.097 0" mass="0.05" condim="3" friction="1 .03 .003" rgba="0.55 0.62 0.58 1" solref="0.01 1"/>
+      <geom type="box" name="container_right" size="0.1 0.003 0.02" pos="0 -0.097 0" mass="0.05" condim="3" friction="1 .03 .003" rgba="0.55 0.62 0.58 1" solref="0.01 1"/>
+      <geom type="box" name="container_front" size="0.003 0.094 0.02" pos="0.097 0 0" mass="0.05" condim="3" friction="1 .03 .003" rgba="0.55 0.62 0.58 1" solref="0.01 1"/>
+      <geom type="box" name="container_back" size="0.003 0.094 0.02" pos="-0.097 0 0" mass="0.05" condim="3" friction="1 .03 .003" rgba="0.55 0.62 0.58 1" solref="0.01 1"/>
+    </body>
   </worldbody>
 
   <!-- The parking brake: while the base is parked, src/robot.ts welds the chassis to the floor where it stopped,

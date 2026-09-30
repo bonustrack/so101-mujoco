@@ -8,7 +8,8 @@ import { STEP, TURN, wrap, type Obj, type Robot } from "./robot";
 export type ChoiceQuestion = { type: "choice"; instructions: string; criteria: Record<string, string> };
 
 // Where a held object goes: the top of an object, or a spot on the floor. x and y in the arm's frame.
-export type Target = { label: string; x: number; y: number; top: number; yaw: number | null; object: Obj | null };
+// `into`: the object goes into the container `object`, dropped at a free spot inside.
+export type Target = { label: string; x: number; y: number; top: number; yaw: number | null; object: Obj | null; into?: boolean };
 // A base move asked for in the goal: from where the base stood when the run started, `amount` metres
 // straight ahead (negative: back) or `amount` radians turned (positive: left).
 export type Drive = { turn: boolean; amount: number; from: { x: number; y: number; yaw: number } };
@@ -27,7 +28,8 @@ export type Task =
   | { kind: "stack"; objects: Obj[]; spot: Spot; skipped: string[] } // bottom to top
   | { kind: "put_on"; object: Obj; onto: Obj }
   | { kind: "drive"; drive: Drive; text: string }
-  | { kind: "drive_to"; object: Obj };
+  | { kind: "drive_to"; object: Obj }
+  | { kind: "put_in"; objects: Obj[]; container: Obj; skipped: string[] };
 // Where a tower stands: where its base is, or a spot on the floor the base moves to first, in world
 // coordinates, since the robot may drive while it builds.
 export type Spot = "here" | { x: number; y: number; label: string };
@@ -57,12 +59,14 @@ export const TASKS = {
   stack_all: 'Stack every object, boxes and balls, into one tower. Right only when `goal` asks to stack everything or all the objects, balls included.',
   put_on: 'Put one object on top of one other object. Right for goals like "put Box 2 on Box 1", "put the ball on the big box" or "place the small box on the other one".',
   drive: 'Move the robot\'s wheeled base only: drive forward or back, or turn or rotate left or right, without taking anything. Right for goals like "go forward", "drive back 20 cm", "turn left", "rotate right 45 degrees" or "turn around".',
-  drive_to: 'Drive the base up to one object without taking it. Right for goals like "drive to the ball" or "go to Box 2". Wrong when `goal` also asks to take, stack or put something: pick that task, the robot drives by itself when it has to.',
+  drive_to: 'Drive the base up to one object without taking it. Right for goals like "drive to the ball", "go to Box 2" or "go to the container". Wrong when `goal` also asks to take, stack or put something: pick that task, the robot drives by itself when it has to.',
+  put_in: 'Put one object into the container. Right for goals like "put the ball in the container", "drop Box 2 into the container" or "put it in the bin".',
+  fill: 'Put several objects into the container: all the balls, all the boxes, or everything. Right for goals like "fill the container with the balls", "put all the boxes in the container", "put everything in the container" or "fill the bin".',
   other:
     "Anything else: lining objects up, clearing the floor, sorting, pushing, throwing, moving the arm without an object, or a goal that is not about these objects.",
 };
 export type TaskName = keyof typeof TASKS;
-export const SUPPORTED = 'Take an object, stack the boxes, stack everything, put one object on another ("put Box 2 on Box 1"), drive or turn ("go forward", "turn left"), or drive to an object.';
+export const SUPPORTED = 'Take an object, stack the boxes, stack everything, put one object on another ("put Box 2 on Box 1"), put an object in the container, fill the container with the balls or the boxes, drive or turn ("go forward", "turn left"), or drive to an object.';
 // Base moves Jev can read from a goal. Amounts snap to these: drives in steps of 10 cm, turns in steps of 15°.
 const MOVES = {
   forward: "Drive forward. Right when `goal` asks to go, drive or move forward, ahead or straight on.",
@@ -85,6 +89,12 @@ const ANGLES = {
   "180_deg": "180 degrees. Right only when `goal` asks to turn around, face the other way, or names 180 degrees or a half turn.",
 };
 
+const WHICH = {
+  balls: 'All the balls. Right when `goal` names balls, like "fill the container with the balls".',
+  boxes: 'All the boxes. Right when `goal` names boxes or cubes, like "put all the boxes in the container".',
+  everything: 'Every object, boxes and balls. Right when `goal` names no kind, like "fill the container" or "put everything in it".',
+};
+
 // Size words computed in code, since Jev does not compare numbers well.
 const area = (o: Obj) => (o.kind === "ball" ? Math.PI * o.size[0] ** 2 : 4 * o.size[0] * o.size[1]);
 const bigFirst = (a: Obj, b: Obj) => area(b) - area(a) || b.size[2] - a.size[2] || a.order - b.order;
@@ -92,6 +102,11 @@ const sizeText = (o: Obj) =>
   o.kind === "ball" ? `${Math.round(o.size[0] * 200)} cm across` : o.size.map((s) => Math.round(s * 200)).join(" x ") + " cm";
 
 function describe(robot: Robot, o: Obj) {
+  if (o.kind === "container") {
+    const { pos } = robot.object(o);
+    const side = pos[1] > 0.04 ? "on the arm's left" : pos[1] < -0.04 ? "on the arm's right" : "in front of the arm";
+    return `${o.label}: the large open container to put objects in, 20 x 20 cm and 4 cm high, ${side}, ${Math.round(robot.polar(pos).r * 100)} cm away`;
+  }
   const same = robot.active().filter((other) => other.kind === o.kind).sort(bigFirst);
   const rank = same.length < 2 ? `the only ${o.kind}` : same[0] === o ? `the largest ${o.kind}` : same.at(-1) === o ? `the smallest ${o.kind}` : `a middle-sized ${o.kind}`;
   const { pos } = robot.object(o);
@@ -140,6 +155,7 @@ export function parseRequest(robot: Robot, goal: string, selected: Obj | null) {
     move: { type: "choice", instructions: "Which way does `goal` ask the robot's base to move?", criteria: MOVES },
     distance: { type: "choice", instructions: "How far does `goal` ask the base to drive?", criteria: DISTANCES },
     angle: { type: "choice", instructions: "How far does `goal` ask the base to turn?", criteria: ANGLES },
+    which: { type: "choice", instructions: "Which objects does `goal` ask to put into the container?", criteria: WHICH },
   };
   return { state, questions };
 }
@@ -153,6 +169,8 @@ const USES: Record<TaskName, string[]> = {
   put_on: ["task", "object", "onto"],
   drive: ["task", "move"],
   drive_to: ["task", "object"],
+  put_in: ["task", "object"],
+  fill: ["task", "which"],
   other: ["task"],
 };
 
@@ -184,6 +202,27 @@ export function readTask(robot: Robot, answers: ParseAnswers, selected: Obj | nu
     const object = find(answers.object?.choice) ?? robot.pickTarget(selected);
     if (!object) return fail("No object to drive to. Add a box or a ball.");
     return { task: { kind: "drive_to", object }, name, confidence, text: `Drive up to ${object.label}.` };
+  }
+  if (name === "put_in" || name === "fill" || (name === "put_on" && find(answers.onto?.choice)?.kind === "container")) {
+    const container = robot.active().find((o) => o.kind === "container");
+    if (!container) return fail("There is no container in the scene. Add one in the Scene section.");
+    const skipped: string[] = [];
+    let objects: Obj[];
+    if (name === "fill") {
+      const which = answers.which?.choice ?? "everything";
+      objects = robot.active().filter((o) => o.kind !== "container" && (which === "everything" || o.kind === (which === "balls" ? "ball" : "box")));
+      for (const o of objects.filter((o) => robot.tooBig(o))) skipped.push(`${o.label} stays out: too big to grab.`);
+      objects = objects.filter((o) => !robot.tooBig(o));
+      if (!objects.length) return fail(`No ${which === "everything" ? "object" : which} to put in the container.${skipped.length ? " " + skipped.join(" ") : ""}`);
+    } else {
+      const object = find(answers.object?.choice);
+      if (!object || object === container) return fail("Jev did not name an object to put in the container.");
+      const why = robot.tooBig(object);
+      if (why) return fail(`${object.label} is too big to grab: ${why}.`);
+      objects = [object];
+    }
+    const text = `Put ${objects.map((o) => o.label).join(", ")} in the container.${skipped.length ? " " + skipped.join(" ") : ""}`;
+    return { task: { kind: "put_in", objects, container, skipped }, name: name === "fill" ? "fill" : "put_in", confidence, text };
   }
   if (name === "put_on") {
     const object = find(answers.object?.choice);
@@ -261,6 +300,11 @@ function towerSpot(robot: Robot, base: Obj, front: boolean, count: number): Spot
 // How many objects a task touches: the turn budget grows with it. A drive counts its steps.
 export const taskSize = (task: Task) =>
   task.kind === "take" || task.kind === "drive_to" ? 1 : task.kind === "put_on" ? 2 : task.kind === "drive" ? 0 : task.objects.length;
+// Where an object goes into the container: its middle for now; the skill picks a free spot inside once there.
+export const intoTarget = (robot: Robot, container: Obj): Target => {
+  const { pos, bottom } = robot.object(container);
+  return { label: "the container", x: pos[0], y: pos[1], top: bottom + 0.004, yaw: null, object: container, into: true };
+};
 export const driveSteps = (drive: Drive) => Math.ceil(Math.abs(drive.amount) / (drive.turn ? TURN : STEP) - 0.01);
 
 // A base move: what is left of it, in metres or radians, from the base's pose now.
@@ -323,22 +367,23 @@ export const onTop = (robot: Robot, o: Obj): Target => {
   return { label: o.label, x: pos[0], y: pos[1], top, yaw: o.kind === "box" ? yaw : null, object: o };
 };
 
-// Driving up to an object, to take it: it ends 20 cm straight ahead of the arm.
+// Driving up to an object, to take it: it ends 20 cm straight ahead of the arm. The container's centre ends 24 cm
+// ahead, clear of the chassis.
 const approachObject = (robot: Robot, o: Obj): Subgoal => ({
   kind: "approach",
   object: o,
-  label: o.label,
+  label: o.label === "Container" ? "the container" : o.label,
   where: () => robot.object(o).pos.slice(0, 2) as [number, number],
-  distance: PICK,
-  text: `Drive to ${o.label}`,
+  distance: o.kind === "container" ? 0.24 : PICK,
+  text: `Drive to ${o.label === "Container" ? "the container" : o.label}`,
 });
 // Driving up to where a held object goes: a tower's top ends where the arm reaches highest.
 const approachTarget = (robot: Robot, o: Obj, target: Target, spot?: { x: number; y: number }): Subgoal => ({
   kind: "approach",
   object: o,
-  label: target.object ? `the top of ${target.label}` : target.label,
+  label: target.into ? target.label : target.object ? `the top of ${target.label}` : target.label,
   where: () => (target.object ? robot.object(target.object).pos.slice(0, 2) : robot.toArm([spot!.x, spot!.y, 0]).slice(0, 2)) as [number, number],
-  distance: target.top > 0.05 ? BEST : PICK,
+  distance: target.into ? BEST : target.top > 0.05 ? BEST : PICK,
   text: `Carry ${o.label} to ${target.object ? target.label : "the spot"}`,
 });
 // Driving up to an object, or to where the held object goes, from wherever the base stands: a skill's try from
@@ -392,6 +437,17 @@ function plainPlan(robot: Robot, task: Task): Plan {
   if (task.kind === "take") {
     const current: Subgoal = { kind: "take", object: task.object, text: `Take ${task.object.label}` };
     return { steps: [{ text: current.text, done: robot.focus === task.object && robot.held() }], current };
+  }
+  if (task.kind === "put_in") {
+    const steps: Step[] = [];
+    let current: Subgoal | null = null;
+    for (const o of task.objects) {
+      const text = `Put ${o.label} in the container`;
+      const done = robot.inside(o, task.container) && clear(robot, o);
+      steps.push({ text, done });
+      if (!done && !current) current = { kind: "place", object: o, target: intoTarget(robot, task.container), text };
+    }
+    return { steps, current };
   }
   if (task.kind === "put_on") {
     const done = restingOn(robot, task.object, task.onto) && clear(robot, task.object);

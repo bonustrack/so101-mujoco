@@ -201,8 +201,8 @@ let end = last(events);
 const sent = parsed as JevRequest | null;
 report(end.outcome === "success" && calls === 1 && robot.held(), "take the box: one Jev call, code does the rest", `${calls} call, ${skills(events).join(" > ")}: ${end.text}`);
 report(
-  sent?.state.goal === "Take the box" && Array.isArray(sent.state.objects) && Object.keys(sent.questions).join() === "task,object,onto,order,spot,move,distance,angle",
-  "the one request has the goal, the objects in words and the eight questions",
+  sent?.state.goal === "Take the box" && Array.isArray(sent.state.objects) && Object.keys(sent.questions).join() === "task,object,onto,order,spot,move,distance,angle,which",
+  "the one request has the goal, the objects in words and the nine questions",
 );
 
 // 5. The box jumps while the jaws come down: the jaws close on nothing, and the second try takes it anyway.
@@ -335,6 +335,25 @@ for (const o of tall) robot.resize(o, [0.015, 0.015, 0.025]);
 events = await loop("stack", reading("stack_boxes"), stopAtFirstStep());
 const read = events.find((e) => e.type === "task") as Extract<AgentEvent, { type: "task" }>;
 report(/Box 4 stays out/.test(read.text), "a tower over 10 cm leaves the last box out", read.text);
+
+// The container: put a ball in it, then fill it with the balls, driving to each and back. Without it, the task says so.
+const box = fresh();
+robot.remove(box);
+const bin = robot.add("container")!;
+robot.place(bin, 0.45, -0.3, 0.4);
+const balls = [robot.add("ball")!, robot.add("ball")!];
+robot.place(balls[0], 0.2, 0.15, 0);
+robot.place(balls[1], -0.1, 0.4, 0);
+robot.reset();
+events = await loop(`put ${balls[0].label} in the container`, reading("put_in", { object: balls[0].label }));
+end = last(events);
+report(end.outcome === "success" && robot.inside(balls[0], bin), "put a ball in the container", `${skills(events).join(" > ")}: ${end.text}`);
+events = await loop("fill the container with the balls", reading("fill", { which: "balls" }));
+end = last(events);
+report(end.outcome === "success" && balls.every((b) => robot.inside(b, bin)), "fill the container with the balls", `${skills(events).join(" > ")}: ${end.text}`);
+robot.remove(bin);
+end = last(await loop("put the ball in the container", reading("put_in", { object: balls[0].label })));
+report(end.outcome === "error" && /no container/.test(end.text), "no container: the task says so", end.text);
 
 // When code has no way left, Jev chooses. A box too heavy to lift: every way to pick it fails, Jev says retry,
 // every way fails again, Jev says stop, and the run ends saying why.

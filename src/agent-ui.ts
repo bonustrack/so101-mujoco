@@ -1,5 +1,5 @@
 // The Jev and Flow sections: key and model, the goal, Run and Stop, a live log of every turn, and what the calls cost.
-import { question, runAgent, type AgentEvent, type ChoiceAnswer, type JevResponse } from "./agent";
+import { BASE_COMMANDS, question, runAgent, type AgentEvent, type ChoiceAnswer, type JevResponse } from "./agent";
 import { SUPPORTED, TASKS, type Plan } from "./plan";
 import { PRICE_NOTE, askJev, jevCost, listModels } from "./jev";
 import type { Obj, Robot } from "./robot";
@@ -29,7 +29,11 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   const status = $("status");
   const flow = $("flow");
   const stages = [...$("diagram").querySelectorAll<HTMLElement>("li")];
-  $("question").textContent = JSON.stringify({ read_the_goal: { task: TASKS }, take_one_object: question("take"), put_one_on_another: question("place") }, null, 2);
+  $("question").textContent = JSON.stringify(
+    { read_the_goal: { task: TASKS }, take_one_object: question("take"), put_one_on_another: question("place"), drive: question("drive"), drive_up_to: question("approach") },
+    null,
+    2,
+  );
   const planBox = $("plan");
   const cost = $("cost");
   const costShort = $("cost-short"); // the session total, in view when Flow is folded
@@ -58,21 +62,18 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   let follow = true;
   flow.onscroll = () => (follow = flow.scrollHeight - flow.scrollTop - flow.clientHeight < 40);
   const target = () => robot.pickTarget(selected());
+  // An empty floor still lets Jev drive the base.
   const idle = () => {
-    const next = target();
-    run.disabled = controller !== null || !key.value.trim() || !next;
+    run.disabled = controller !== null || !key.value.trim();
     stopButton.disabled = controller === null;
-    randomize.disabled = !next;
+    randomize.disabled = !target();
   };
   const hint = () => {
     if (controller) return;
-    status.textContent = !target()
-      ? "Add a box or a ball, then press Run."
-      : key.value.trim()
-        ? `Ready. Press Run. ${SUPPORTED}`
-        : `Paste a key, then press Run. ${SUPPORTED}`;
+    status.textContent = key.value.trim() ? `Ready. Press Run. ${SUPPORTED}` : `Paste a key, then press Run. ${SUPPORTED}`;
   };
-  const highlight = (stage: string | null) => stages.forEach((li) => li.classList.toggle("on", li.dataset.stage === stage));
+  // Driving the base is physics too.
+  const highlight = (stage: string | null) => stages.forEach((li) => li.classList.toggle("on", li.dataset.stage === (stage === "drive" ? "physics" : stage)));
 
   // Fill the model list from GET /v1/models once a key is present; keep the saved choice.
   let asked = "";
@@ -124,7 +125,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
   run.onclick = async () => {
     const apiKey = key.value.trim();
     const next = target();
-    if (!apiKey || controller || !next) return;
+    if (!apiKey || controller) return;
     // The selection is read once, at the start: selecting another object mid-run changes nothing.
     const chosen = selected();
     robot.focus = next;
@@ -174,9 +175,20 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
       row.querySelector("pre")!.textContent = JSON.stringify(state, null, 2);
     };
     // The plan: the task as read, then each step, ticked once code has checked it.
+    // A drive step leaves the plan once the base is there: it stays on the list, ticked, before the step it led to.
+    const drove: { text: string; before: string }[] = [];
     const showPlan = (plan: Plan) => {
-      const now = plan.steps.findIndex((s) => !s.done);
-      const steps = plan.steps.map((s, i) => `<li class="${s.done ? "done" : i === now ? "now" : ""}">${escape(s.text)}</li>`).join("");
+      plan.steps.forEach((s, i) => {
+        const before = plan.steps[i + 1]?.text;
+        if (s.drive && before && !drove.some((d) => d.text === s.text && d.before === before)) drove.push({ text: s.text, before });
+      });
+      const shown = [...plan.steps];
+      for (const d of drove) {
+        const at = shown.findIndex((s) => s.text === d.before);
+        if (at >= 0 && !shown.some((s) => s.text === d.text)) shown.splice(at, 0, { text: d.text, done: true });
+      }
+      const now = shown.findIndex((s) => !s.done);
+      const steps = shown.map((s, i) => `<li class="${s.done ? "done" : i === now ? "now" : ""}">${escape(s.text)}</li>`).join("");
       planBox.querySelector("ol")!.innerHTML = steps;
       planBox.hidden = false;
     };
@@ -227,7 +239,7 @@ export function setupAgent(robot: Robot, selected: () => Obj | null, lock: (lock
           break;
         }
         case "result":
-          add(`<p><span class="tag">Arm</span>${escape(event.text)}</p>`);
+          add(`<p><span class="tag">${BASE_COMMANDS.includes(event.command) ? "Base" : "Arm"}</span>${escape(event.text)}</p>`);
           break;
         case "check":
           add(`<p><span class="tag">Check</span>${escape(event.text)}</p>`, event.success ? "ok" : "");
@@ -271,9 +283,10 @@ const STAGE_TEXT: Record<string, string> = {
   jev: "waiting for Jev",
   ik: "solving the joint angles",
   physics: "moving the arm",
+  drive: "driving the base",
   check: "checking the result",
 };
-const DONE_TEXT: Record<string, string> = { take: "Lifted.", stack_boxes: "Stacked.", stack_all: "Stacked.", put_on: "Placed." };
+const DONE_TEXT: Record<string, string> = { take: "Lifted.", stack_boxes: "Stacked.", stack_all: "Stacked.", put_on: "Placed.", drive: "Moved.", drive_to: "Arrived." };
 const END_TEXT: Record<Extract<AgentEvent, { type: "end" }>["outcome"], string> = {
   success: "Done.",
   done: "Jev stopped.",

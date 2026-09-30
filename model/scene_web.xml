@@ -1,16 +1,69 @@
 <!-- Scene for the web demo. Derived from the Menagerie scene_box.xml: same arm,
      floor and box material. The site draws the scene with three.js, so the Menagerie
      visual settings are left out.
+     The arm rides on a mobile base: a 21 x 14 cm chassis of 2 kg on 4 wheels, free on the floor.
+     so101.xml is attached unchanged on top of the chassis, so the arm's base sits 5 cm up.
+     The wheels are hinge joints with velocity actuators, rubber on the floor (friction 1).
+     The left pair and the right pair get the same speed (skid steering): same speeds drive,
+     opposite speeds turn on the spot. src/robot.ts closes the loop on the chassis pose.
      Objects come from a fixed pool of 6 boxes and 6 balls (box0 to box5, ball0 to ball5),
      so the page can add, move, resize and remove them without recompiling the model.
      src/robot.ts hides the unused ones below the floor with collisions off, and sets each
      object's size, mass and inertia at runtime (density 1000 kg/m³). At first only box0
-     is out: a 3 x 3 x 4 cm box of 36 g where a top-down grasp reaches it. -->
+     is out: a 3 x 3 x 4 cm box of 36 g on the floor where a top-down grasp reaches it. -->
 <mujoco model="so101 web">
-  <include file="so101.xml"/>
+  <compiler angle="radian" autolimits="true"/>
+  <!-- The arm's own simulation settings: an attached model brings its bodies, not its options. -->
+  <option integrator="implicitfast" timestep="0.005" cone="elliptic" iterations="10" ls_iterations="20" impratio="10"/>
+
+  <asset>
+    <model name="so101" file="so101.xml"/>
+  </asset>
+
+  <default>
+    <default class="wheel">
+      <joint type="hinge" axis="0 1 0" damping="0.002" armature="0.0005"/>
+      <geom type="cylinder" size="0.03 0.01" euler="1.5708 0 0" friction="1 0.005 0.0001" mass="0.06" rgba="0.1 0.1 0.1 1"/>
+      <!-- Two light bars across each wheel's outer face, drawn only, so the wheels visibly turn. -->
+      <default class="spoke">
+        <geom type="box" size="0.022 0.0015 0.004" euler="0 0 0" contype="0" conaffinity="0" mass="0" rgba="0.78 0.78 0.75 1"/>
+      </default>
+    </default>
+    <velocity kv="1" ctrlrange="-15 15" forcerange="-0.8 0.8"/>
+  </default>
 
   <worldbody>
     <geom name="floor" size="0 0 0.05" type="plane"/>
+    <!-- The chassis frame is the arm's base frame: x forward, y left, 5 cm above the floor. -->
+    <body name="chassis" pos="0 0 0.05">
+      <freejoint name="chassis"/>
+      <geom name="chassis" type="box" size="0.105 0.07 0.015" pos="-0.025 0 -0.015" mass="2" rgba="0.22 0.23 0.25 1"/>
+      <body name="wheel_fl" pos="0.05 0.085 -0.02" childclass="wheel">
+        <joint name="wheel_fl"/>
+        <geom/>
+        <geom class="spoke" pos="0 0.0105 0"/>
+        <geom class="spoke" pos="0 0.0105 0" euler="0 1.5708 0"/>
+      </body>
+      <body name="wheel_fr" pos="0.05 -0.085 -0.02" childclass="wheel">
+        <joint name="wheel_fr"/>
+        <geom/>
+        <geom class="spoke" pos="0 -0.0105 0"/>
+        <geom class="spoke" pos="0 -0.0105 0" euler="0 1.5708 0"/>
+      </body>
+      <body name="wheel_rl" pos="-0.1 0.085 -0.02" childclass="wheel">
+        <joint name="wheel_rl"/>
+        <geom/>
+        <geom class="spoke" pos="0 0.0105 0"/>
+        <geom class="spoke" pos="0 0.0105 0" euler="0 1.5708 0"/>
+      </body>
+      <body name="wheel_rr" pos="-0.1 -0.085 -0.02" childclass="wheel">
+        <joint name="wheel_rr"/>
+        <geom/>
+        <geom class="spoke" pos="0 -0.0105 0"/>
+        <geom class="spoke" pos="0 -0.0105 0" euler="0 1.5708 0"/>
+      </body>
+      <attach model="so101" body="base" prefix=""/>
+    </body>
     <replicate count="6" offset="0 -0.06 0">
       <body name="box" pos="0.2 0.08 0.02">
         <freejoint/>
@@ -26,4 +79,19 @@
       </body>
     </replicate>
   </worldbody>
+
+  <!-- The parking brake: while the base is parked, src/robot.ts welds the chassis to the floor where it stopped,
+       and lets go while it drives. Left free, the chassis rocks on MuJoCo's soft wheel contacts whenever the arm
+       swings, and that shakes small objects out of the jaws. -->
+  <equality>
+    <weld name="brake" body1="chassis" solref="0.01 1"/>
+  </equality>
+
+  <!-- Wheel speeds in rad/s: 15 rad/s is 45 cm/s at the rim. -->
+  <actuator>
+    <velocity name="wheel_fl" joint="wheel_fl"/>
+    <velocity name="wheel_fr" joint="wheel_fr"/>
+    <velocity name="wheel_rl" joint="wheel_rl"/>
+    <velocity name="wheel_rr" joint="wheel_rr"/>
+  </actuator>
 </mujoco>

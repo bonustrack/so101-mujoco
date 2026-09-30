@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>SO-101 arm in MuJoCo</title>
-    <meta name="description" content="The SO-101 robot arm, simulated live with MuJoCo physics in your browser." />
+    <meta name="description" content="The SO-101 robot arm on a wheeled base, simulated live with MuJoCo physics in your browser." />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ffd11f'/%3E%3C/svg%3E" />
     <link rel="preload" href="/so101.pack.gz" as="fetch" crossorigin />
   </head>
@@ -22,7 +22,7 @@
       <header>
         <h1>SO-101 <span>with Jev</span></h1>
         <span id="clock" title="Simulated time">Not started</span>
-        <button id="reset" type="button" title="Arm back to rest, objects back where you placed them" disabled>Reset</button>
+        <button id="reset" type="button" title="Arm back to rest, base back to its start, objects back where you placed them" disabled>Reset</button>
         <button id="fold" type="button" class="icon" aria-expanded="true" aria-controls="sections" title="Hide the panel"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5" /></svg></button>
       </header>
 
@@ -31,6 +31,19 @@
           <h2><button type="button" aria-expanded="false">Robot</button></h2>
           <div id="poses"></div>
           <div id="joints"></div>
+        </section>
+
+        <section>
+          <h2><button type="button" aria-expanded="true">Drive</button><span id="base-pose" title="Where the base is, from where it started: cm forward and left, then its heading"></span></h2>
+          <div class="drive">
+            <div id="pad" role="group" aria-label="Drive the base">
+              <button type="button" class="icon up" data-command="drive_forward" title="Forward 10 cm" aria-label="Forward 10 cm" disabled><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 7.5 6 4l3.5 3.5" /></svg></button>
+              <button type="button" class="icon" data-command="turn_left" title="Turn left 15°" aria-label="Turn left 15°" disabled><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M7.5 2.5 4 6l3.5 3.5" /></svg></button>
+              <button type="button" class="icon" data-command="drive_backward" title="Back 10 cm" aria-label="Back 10 cm" disabled><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5" /></svg></button>
+              <button type="button" class="icon" data-command="turn_right" title="Turn right 15°" aria-label="Turn right 15°" disabled><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5 8 6l-3.5 3.5" /></svg></button>
+            </div>
+            <p class="note">Each press drives 10 cm or turns 15° on the spot. The arm folds first, and the base stops if it touches an object.</p>
+          </div>
         </section>
 
         <section>
@@ -55,7 +68,7 @@
             <select id="jev-model" aria-label="Model"><option>jev-latest</option></select>
             <button id="jev-clear" type="button">Clear</button>
           </div>
-          <textarea id="goal" rows="1" spellcheck="false" aria-label="Goal" placeholder="Take the box, stack all the boxes, put Box 2 on Box 1">Take the box</textarea>
+          <textarea id="goal" rows="1" spellcheck="false" aria-label="Goal" placeholder="Take the box, stack all the boxes, put Box 2 on Box 1, go forward, drive to the ball and take it">Take the box</textarea>
           <div class="buttons">
             <button id="run" type="button" class="primary" disabled>Run</button>
             <button id="stop" type="button" disabled>Stop</button>
@@ -64,7 +77,8 @@
           <p id="status">Paste a key, then press Run.</p>
           <details id="how">
             <summary>How the loop works</summary>
-            <p class="note">Jev is a decision model, not a chat model: it picks from fixed lists, with a probability for each option. First it reads the goal: one call maps it to a task (take one object, stack the boxes, stack everything, put one object on another) and fills in which object, onto which, the order and the spot. Code turns the task into a plan of pick-and-place steps, biggest box at the bottom, and makes the plan again after every turn, so a box that falls goes back on the list. Each turn, code turns the scene into plain facts and Jev picks the next command for the current step. Code solves the joint angles (IK), MuJoCo moves the arm, and code checks each step: an object counts as placed once it rests on its target, let go, still for 0.5 s. At most 8 turns per object, plus 4. The arm reaches about 10 cm up with its fingers pointing down, so a tower stops there.</p>
+            <p class="note">Jev is a decision model, not a chat model: it picks from fixed lists, with a probability for each option. First it reads the goal: one call maps it to a task (take one object, stack the boxes, stack everything, put one object on another, drive or turn, drive to an object) and fills in which object, onto which, the order, the spot, and which way and how far to drive. Code turns the task into a plan of pick-and-place steps, biggest box at the bottom, and makes the plan again after every turn, so a box that falls goes back on the list. Each turn, code turns the scene into plain facts and Jev picks the next command for the current step. Code solves the joint angles (IK), MuJoCo moves the arm, and code checks each step: an object counts as placed once it rests on its target, let go, still for 0.5 s. At most 8 turns per object, plus 4. The arm reaches about 10 cm up with its fingers pointing down, so a tower stops there.</p>
+            <p class="note">The arm rides on a wheeled base: the left and right wheel pairs turn at set speeds, together to drive, against each other to turn on the spot. When an object or a tower is out of the arm's reach, the plan first drives the base up to it, one Jev turn. Driving on its own goes in steps of 10 cm or 15°, one turn each. Parked, the base is braked.</p>
             <p id="price" class="note"></p>
             <p class="note">The key stays in this browser. Calls go through this site's Netlify Function, because TypeSafe blocks browser calls. It passes the key on and never stores or logs it.</p>
             <details>

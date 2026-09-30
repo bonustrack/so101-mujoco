@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import type { MainModule, MjModel } from "@mujoco/mujoco";
+import { COMMANDS } from "./agent";
 import { setupAgent } from "./agent-ui";
 import { setupEditor, type Editor } from "./editor";
 import { JOINTS, REST, createRobot, loadModel, type Obj, type Robot } from "./robot";
@@ -63,7 +64,8 @@ scene.add(sun, sun.target);
 const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshStandardMaterial({ color: BG, roughness: 1 }));
 floor.receiveShadow = true;
 scene.add(floor);
-const grid = new THREE.GridHelper(2, 20, 0xd6d6cf, 0xe0e0da);
+// 10 cm cells, the length of one drive step.
+const grid = new THREE.GridHelper(4, 40, 0xd6d6cf, 0xe0e0da);
 grid.rotation.x = Math.PI / 2;
 grid.position.z = 0.0005;
 scene.add(grid);
@@ -123,6 +125,17 @@ let editor: Editor | null = null;
 let refreshControls = () => {};
 let last = performance.now();
 let budget = 0;
+let followed: { x: number; y: number } | null = null;
+
+// The view follows the base as it drives: the camera, its target and the sun shift with it, the angle stays.
+function follow(robot: Robot) {
+  const { x, y } = robot.base();
+  if (followed) {
+    const shift = new THREE.Vector3(x - followed.x, y - followed.y, 0);
+    if (shift.lengthSq() > 0) for (const v of [camera.position, controls.target, sun.position, sun.target.position]) v.add(shift);
+  }
+  followed = { x, y };
+}
 
 renderer.setAnimationLoop((now) => {
   const dt = Math.min((now - last) / 1000, 0.1);
@@ -135,6 +148,7 @@ renderer.setAnimationLoop((now) => {
       budget -= robot.model.opt.timestep;
     }
     sim.sync();
+    follow(robot);
     editor?.frame();
     refreshControls();
   }
@@ -155,6 +169,7 @@ loading
       controls.lock(locked);
       edit.lock(locked);
     });
+    controls.onDrive(() => agent?.refresh());
     controls.onReset(agent.stop);
     editor = edit;
   })
@@ -325,8 +340,27 @@ function buildControls(robot: Robot) {
     buttons.forEach((b, i) => b.classList.toggle("active", i === 0));
   };
 
+  // The drive pad runs the same commands Jev picks from, one step per press. A press during a step is ignored.
+  const pad = [...$("pad").querySelectorAll<HTMLButtonElement>("button")];
+  let driving = false;
+  let afterDrive = () => {};
+  for (const button of pad) {
+    button.disabled = false;
+    button.onclick = async () => {
+      if (driving) return;
+      driving = true;
+      button.classList.add("active");
+      buttons.forEach((b) => b.classList.remove("active"));
+      await COMMANDS[button.dataset.command!].run!(robot, () => {});
+      button.classList.remove("active");
+      driving = false;
+      afterDrive();
+    };
+  }
+
   // Sliders show the target, the numbers show where each joint actually is.
   const clock = $("clock");
+  const basePose = $("base-pose");
   return {
     refresh() {
       const angles = robot.joints();
@@ -335,14 +369,19 @@ function buildControls(robot: Robot) {
         output.value = `${Math.round(THREE.MathUtils.radToDeg(angles[i]))}°`;
       });
       clock.textContent = `${robot.data.time.toFixed(1)} s`;
+      const { x, y, yaw } = robot.base();
+      basePose.textContent = `${Math.round(x * 100)}, ${Math.round(y * 100)} cm · ${Math.round(THREE.MathUtils.radToDeg(yaw))}°`;
     },
-    // While Jev drives the arm, the manual poses and sliders are off.
+    // While Jev drives the arm, the manual poses, sliders and drive pad are off.
     lock(locked: boolean) {
-      [...buttons, ...sliders.map((s) => s.input)].forEach((el) => (el.disabled = locked));
+      [...buttons, ...sliders.map((s) => s.input), ...pad].forEach((el) => (el.disabled = locked));
       if (locked) buttons.forEach((b) => b.classList.remove("active"));
     },
     onReset(callback: () => void) {
       beforeReset = callback;
+    },
+    onDrive(callback: () => void) {
+      afterDrive = callback;
     },
   };
 }

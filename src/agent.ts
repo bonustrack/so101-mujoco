@@ -3,13 +3,15 @@
 // model: it answers Choice questions over fixed lists, with a probability per option. Numbers,
 // geometry and the plan stay in code.
 //
-// 1. Goal: one Jev call maps the goal text to a task (take, stack the boxes, stack everything, put X on Y)
-//    and its parameters (which object, onto which, stack order, where).
-// 2. Plan: code expands the task into pick-and-place subgoals (plan.ts), again after every turn.
+// 1. Goal: one Jev call maps the goal text to a task (take, stack the boxes, stack everything, put X on Y,
+//    drive or turn, drive to an object) and its parameters (which object, onto which, stack order, where,
+//    which way and how far).
+// 2. Plan: code expands the task into subgoals (plan.ts), again after every turn: pick-and-place, and a
+//    drive up to anything out of the arm's reach.
 // 3. Turns: for the current subgoal, Jev picks the next command among the ones that fit it.
 // 4. Check: code decides when a subgoal is achieved and when the whole task is.
-import { CLOSED, GRIPPER, LIFTED, OPEN, REST, type Obj, type Robot, type Vec3 } from "./robot";
-import { clear, parseRequest, plan, readTask, restingOn, taskSize, type ChoiceQuestion, type Plan, type Subgoal, type Target, type Task, type TaskName } from "./plan";
+import { CLOSED, GRIPPER, LIFTED, OPEN, REST, STEP, TURN, wrap, type Obj, type Robot, type Vec3 } from "./robot";
+import { REACH, clear, driveSteps, driven, inReach, parseRequest, plan, readTask, restingOn, taskSize, toGo, type ChoiceQuestion, type Drive, type Plan, type Subgoal, type Target, type Task, type TaskName } from "./plan";
 
 export type ChoiceAnswer = { type: "choice"; choice: string; probabilities: Record<string, number>; confidence: number };
 export type JevRequest = { model: string; state: Record<string, unknown>; questions: Record<string, ChoiceQuestion> };
@@ -18,8 +20,10 @@ export type Decide = (request: JevRequest, signal: AbortSignal) => Promise<JevRe
 export type Observation = ReturnType<typeof observe>;
 type Step = { command: string; result: string };
 type Place = Extract<Subgoal, { kind: "place" }>;
+type Approach = Extract<Subgoal, { kind: "approach" }>;
+type DriveSub = Extract<Subgoal, { kind: "drive" }>;
 
-export type Stage = "observe" | "jev" | "ik" | "physics" | "check";
+export type Stage = "observe" | "jev" | "ik" | "physics" | "drive" | "check";
 export type AgentEvent =
   | { type: "stage"; stage: Stage }
   | { type: "task"; request: JevRequest; answers: Record<string, ChoiceAnswer>; name: TaskName; confidence: number; text: string; ok: boolean; maxTurns: number; model: string; ms: number; usage: JevResponse["usage"] }
@@ -34,12 +38,17 @@ const HOVER = 0.03; // jaw tips 3 cm above the object top
 const CARRY = 0.015; // a carried object 1.5 cm above its target: towers get close to the arm's reach
 const LIFT = 0.08;
 // The turn budget grows with the objects a task moves: 8 per object, plus 4. An object that falls and has
-// to be placed again adds 8, twice at most.
-export const maxTurns = (task: Task) => 8 * taskSize(task) + 4;
+// to be placed again adds 8, twice at most. A drive gets one turn per step, plus 2; every drive up to
+// something out of reach adds 3.
+export const maxTurns = (task: Task) => (task.kind === "drive" ? driveSteps(task.drive) + 2 : 8 * taskSize(task) + 4);
 const REDO = 8;
+const APPROACH = 3;
 
 const cm = (m: number) => Math.round(m * 1000) / 10;
-type Run = (robot: Robot, stage: (s: Stage) => void, target?: Target) => Promise<string>;
+const deg = (rad: number) => Math.round((rad * 180) / Math.PI);
+type Run = (robot: Robot, stage: (s: Stage) => void, target?: Target, sub?: Subgoal) => Promise<string>;
+// The base commands, which the page's drive pad runs too.
+export const BASE_COMMANDS = ["drive_forward", "drive_backward", "turn_left", "turn_right", "drive_to_object"];
 
 // The commands Jev chooses from. The text is what Jev reads; `run` is what the arm does.
 // Each text names the exact observation values that make the command right, because Jev reads
@@ -192,6 +201,26 @@ export const COMMANDS: Record<string, { text: string; run?: Run }> = {
       return clear(robot, robot.focus!) ? "Moved out, jaws clear." : "Moved out, but the jaws are still around the object.";
     },
   },
+  drive_forward: {
+    text: 'Drive the wheeled base straight forward one step, 10 cm, or what is left when `observation.to_go` is shorter. Right when `observation.to_go` says forward.',
+    run: (robot, stage, _target, sub) => driveStep(robot, stage, false, 1, sub),
+  },
+  drive_backward: {
+    text: 'Drive the wheeled base straight back one step, 10 cm, or what is left when `observation.to_go` is shorter. Right when `observation.to_go` says back.',
+    run: (robot, stage, _target, sub) => driveStep(robot, stage, false, -1, sub),
+  },
+  turn_left: {
+    text: 'Turn the wheeled base left on the spot one step, 15 degrees, or what is left when `observation.to_go` is smaller. Right when `observation.to_go` says left.',
+    run: (robot, stage, _target, sub) => driveStep(robot, stage, true, 1, sub),
+  },
+  turn_right: {
+    text: 'Turn the wheeled base right on the spot one step, 15 degrees, or what is left when `observation.to_go` is smaller. Right when `observation.to_go` says right.',
+    run: (robot, stage, _target, sub) => driveStep(robot, stage, true, -1, sub),
+  },
+  drive_to_object: {
+    text: 'Turn the wheeled base to face `observation.destination`, then drive until it is in reach of the arm. Right when `observation.destination_reach` is not "in reach".',
+    run: (robot, stage, _target, sub) => approach(robot, stage, sub as Approach),
+  },
   go_home: {
     text: "Fold the arm back to its rest pose. Right only when `goal` asks for the rest pose.",
     run: async (robot, stage) => {
@@ -211,6 +240,17 @@ const DONE_PLACE =
 const KINDS = {
   take: ["open_gripper", "move_above_object", "lower_to_object", "close_gripper", "lift", "go_home", "done"],
   place: ["open_gripper", "move_above_object", "lower_to_object", "close_gripper", "move_above_target", "lower_to_place", "release", "retreat", "done"],
+  drive: ["drive_forward", "drive_backward", "turn_left", "turn_right"],
+  approach: ["drive_to_object", "drive_forward", "drive_backward", "turn_left", "turn_right"],
+};
+const INSTRUCTIONS = {
+  take: "A robot arm is working toward `goal`. `observation` is the scene right now and `history` lists the commands already run, oldest first. Which command should the arm run next?",
+  place:
+    "A robot arm is working toward `goal`, one step at a time. Right now it must do `subgoal`: pick up `observation.object`, set it down on `observation.target`, let go, and move the jaws away from it. `observation` is the scene right now and `history` lists the commands already run for this subgoal, oldest first. Which command should the arm run next?",
+  drive:
+    "A robot arm rides on a wheeled base, working toward `goal`. The base must still move by `observation.to_go`. `history` lists the commands already run, oldest first. Which command should the robot run next?",
+  approach:
+    "A robot arm rides on a wheeled base, working toward `goal`, one step at a time. Right now it must do `subgoal`: move the base until `observation.destination` is in reach of the arm. `observation` is the scene right now and `history` lists the commands already run for this subgoal, oldest first. Which command should the robot run next?",
 };
 
 // One question per turn. Instructions point at state fields by name, as the TypeSafe docs advise.
@@ -218,10 +258,7 @@ export function question(kind: Subgoal["kind"]): Record<string, ChoiceQuestion> 
   return {
     next_command: {
       type: "choice",
-      instructions:
-        kind === "take"
-          ? "A robot arm is working toward `goal`. `observation` is the scene right now and `history` lists the commands already run, oldest first. Which command should the arm run next?"
-          : "A robot arm is working toward `goal`, one step at a time. Right now it must do `subgoal`: pick up `observation.object`, set it down on `observation.target`, let go, and move the jaws away from it. `observation` is the scene right now and `history` lists the commands already run for this subgoal, oldest first. Which command should the arm run next?",
+      instructions: INSTRUCTIONS[kind],
       criteria: Object.fromEntries(KINDS[kind].map((name) => [name, kind === "place" && name === "done" ? DONE_PLACE : COMMANDS[name].text])),
     },
   };
@@ -300,6 +337,119 @@ export function observePlace(robot: Robot, sub: Place) {
   };
 }
 
+// A base move asked for in the goal: how far it went, and what is left.
+export function observeDrive(robot: Robot, sub: DriveSub) {
+  const { drive } = sub;
+  const left = toGo(robot, drive);
+  const done = drive.amount - left;
+  const way = drive.turn ? (left > 0 ? "left" : "right") : left > 0 ? "forward" : "back";
+  return {
+    [drive.turn ? "base_turned_deg" : "base_moved_cm"]: drive.turn ? deg(done) : cm(done),
+    to_go: driven(robot, drive) ? "nothing, the base is there" : drive.turn ? `${Math.abs(deg(left))} degrees ${way}` : `${Math.abs(cm(left))} cm ${way}`,
+  };
+}
+
+// Driving up to something: where it is from the arm, in words and numbers, and whether the arm reaches it.
+export function observeApproach(robot: Robot, sub: Approach) {
+  const where = sub.where();
+  const { r, a } = robot.polar(where);
+  const held = robot.active().find(robot.gripped);
+  const side = a > 0 ? "left" : "right";
+  const direction =
+    Math.abs(a) < 0.17 ? "straight ahead" : Math.abs(a) < 1.1 ? `ahead on the ${side}` : Math.abs(a) < 2 ? `on the ${side}` : `behind on the ${side}`;
+  const reach = inReach(robot, where) ? "in reach" : r > REACH[1] ? "too far" : r < REACH[0] ? "too close" : "off to the side";
+  return {
+    destination: sub.label,
+    holding: held ? held.label : "nothing",
+    destination_distance_cm: cm(r),
+    destination_direction: direction,
+    destination_angle_deg: deg(a),
+    destination_reach: reach,
+  };
+}
+// Before the base moves: an object in the jaws is raised clear of everything around, else the arm folds to
+// rest with the jaws open, ready for what it drives to, rising first out of anything it is near, so the
+// robot drags nothing along and sweeps nothing over.
+async function stow(robot: Robot, stage: (s: Stage) => void) {
+  const tip = robot.tcp();
+  const near = robot.active().filter((o) => Math.hypot(robot.object(o).pos[0] - tip[0], robot.object(o).pos[1] - tip[1]) < 0.35);
+  const held = near.find(robot.gripped);
+  const tallest = Math.max(0, ...near.filter((o) => o !== held).map((o) => robot.object(o).top));
+  stage("ik");
+  if (held) {
+    const up = Math.max(0.05, tallest + 0.02) - robot.object(held).bottom;
+    if (up < 0.005) return;
+    const path = line(robot, tip, [tip[0], tip[1], tip[2] + up], TILT, robot.handYaw());
+    stage("physics");
+    await robot.play(path, 1.0);
+    return;
+  }
+  const q = robot.joints();
+  const folded = REST.slice(0, GRIPPER).every((v, i) => Math.abs(q[i] - v) < 0.05);
+  if (folded && q[GRIPPER] > 0.5) return;
+  const rise = !folded && tip[2] < tallest + 0.04 ? line(robot, tip, [tip[0], tip[1], tallest + 0.04], TILT, robot.handYaw()) : [];
+  stage("physics");
+  await robot.play([...rise, [...REST.slice(0, GRIPPER), OPEN]], folded ? 0.5 : rise.length ? 2.2 : 1.5);
+}
+
+// One base step: 10 cm or 15°, or what is left of the goal's move when that is less.
+async function driveStep(robot: Robot, stage: (s: Stage) => void, turn: boolean, sign: 1 | -1, sub?: Subgoal) {
+  const step = turn ? TURN : STEP;
+  const left = sub?.kind === "drive" && sub.drive.turn === turn ? sign * toGo(robot, sub.drive) : step;
+  const amount = sign * (left > 0 ? Math.min(step, left) : step);
+  await stow(robot, stage);
+  stage("drive");
+  const r = await robot.move(turn ? "turn" : "drive", amount);
+  const text = turn ? `Turned ${Math.abs(deg(r.turned))}° ${r.turned > 0 ? "left" : "right"}.` : `Drove ${Math.abs(cm(r.moved))} cm ${r.moved > 0 ? "forward" : "back"}.`;
+  return r.bumped ? `${text} Stopped early: the base touched ${r.bumped.label}.` : text;
+}
+
+// Face the destination, then drive until it sits at the subgoal's distance straight ahead. Turning on the spot
+// moves the arm's base a little, so it checks and corrects, three rounds at most.
+async function approach(robot: Robot, stage: (s: Stage) => void, sub: Approach) {
+  await stow(robot, stage);
+  stage("drive");
+  let bumped: Obj | null = null;
+  let [moved, turned] = [0, 0];
+  for (let i = 0; i < 3 && !bumped; i++) {
+    const { a } = robot.polar(sub.where());
+    if (Math.abs(a) > 0.03) {
+      const r = await robot.move("turn", a);
+      turned += r.turned;
+      bumped = r.bumped;
+    }
+    const d = robot.polar(sub.where()).r - sub.distance;
+    if (!bumped && Math.abs(d) > 0.005) {
+      const r = await robot.move("drive", d);
+      moved += r.moved;
+      bumped = r.bumped;
+    }
+    const now = robot.polar(sub.where());
+    if (Math.abs(now.a) < 0.05 && Math.abs(now.r - sub.distance) < 0.01) break;
+  }
+  const { r, a } = robot.polar(sub.where());
+  const text = `Turned ${Math.abs(deg(turned))}° ${turned > 0 ? "left" : "right"}, drove ${Math.abs(cm(moved))} cm ${moved < 0 ? "back" : "forward"}: ${sub.label} is ${cm(r)} cm away, ${Math.abs(deg(a))}° ${a > 0 ? "left" : "right"}.`;
+  return bumped ? `Stopped early: the base touched ${bumped.label}. ${text}` : text;
+}
+
+// Driving: the base is where the goal asked, still 0.5 s later. Approaching: the destination is in reach.
+async function checkBase(robot: Robot, sub: DriveSub | Approach) {
+  if (sub.kind === "approach") {
+    const { r, a } = robot.polar(sub.where());
+    const ok = inReach(robot, sub.where());
+    return { success: ok, text: `${sub.label} is ${cm(r)} cm away, ${Math.abs(deg(a))}° ${a > 0 ? "left" : "right"}: ${ok ? "in reach" : "not in reach yet"}.` };
+  }
+  const left = toGo(robot, sub.drive);
+  if (!driven(robot, sub.drive)) return { success: false, text: `${sub.drive.turn ? `${Math.abs(deg(left))}°` : `${Math.abs(cm(left))} cm`} to go.` };
+  await robot.hold(0.5);
+  return { success: true, text: baseMoved(robot, sub.drive) };
+}
+// How far the base went on the goal's move, in words.
+function baseMoved(robot: Robot, drive: Drive) {
+  const done = drive.amount - toGo(robot, drive);
+  return `The base ${drive.turn ? `turned ${Math.abs(deg(done))}° ${done > 0 ? "left" : "right"}` : `moved ${Math.abs(cm(done))} cm ${done > 0 ? "forward" : "back"}`}.`;
+}
+
 // Taking: the target's lowest point 5 cm up, gripped by both jaws, for 1 s.
 async function checkTake(robot: Robot) {
   const name = robot.focus!.label;
@@ -345,6 +495,11 @@ async function checkAll(robot: Robot, task: Task) {
     const top = robot.object(task.objects.at(-1)!).top;
     return { success: true, text: `${task.objects.length} objects stacked, ${cm(top)} cm tall, standing for 1 s.` };
   }
+  if (task.kind === "drive") return { success: true, text: baseMoved(robot, task.drive) };
+  if (task.kind === "drive_to") {
+    const { r } = robot.polar(robot.object(task.object).pos);
+    return { success: true, text: `${task.object.label} is in reach, ${cm(r)} cm from the arm.` };
+  }
   return { success: true, text: "Done and still for 1 s." };
 }
 
@@ -374,18 +529,17 @@ export async function runAgent(options: {
   const tally = () => `${turn} turns, ${calls} Jev calls, ${tokens.toLocaleString("en-US")} input tokens.`;
   try {
     // 1. The goal: one call, the task and its parameters.
-    if (!robot.active().length) return end("error", "No object on the table. Add a box or a ball.");
     stage("observe");
     const parse = parseRequest(robot, goal, selected);
     const parseRequestBody: JevRequest = { model, ...parse };
     stage("jev");
     const { response: parsed, ms } = await ask(parseRequestBody);
-    for (const q of ["task", "object", "onto", "order", "spot"])
+    for (const q of Object.keys(parse.questions))
       if (parsed.answers?.[q]?.type !== "choice") throw new Error(`Unexpected answer from Jev: ${JSON.stringify(parsed).slice(0, 200)}`);
     const reading = readTask(robot, parsed.answers, selected);
     const task = reading.task;
     let limit = task ? maxTurns(task) : 0;
-    const most = limit + 2 * REDO;
+    let most = limit + 2 * REDO;
     emit({ type: "task", request: parseRequestBody, answers: parsed.answers, name: reading.name, confidence: reading.confidence, text: reading.text, ok: !!task, maxTurns: limit, model: parsed.model, ms, usage: parsed.usage });
     if (!task) return end("error", reading.text);
 
@@ -400,15 +554,21 @@ export async function runAgent(options: {
     let subgoal = "";
     for (turn = 1; turn <= limit; turn++) {
       const sub = current.current!;
-      if (!sub.object.active) return end("error", `${sub.object.label} was deleted.`);
-      if (sub.text !== subgoal) history = [];
+      if (sub.kind !== "drive" && !sub.object.active) return end("error", `${sub.object.label} was deleted.`);
+      if (sub.text !== subgoal) {
+        history = [];
+        // Each drive up to something out of reach gets its own turns.
+        if (sub.kind === "approach") [limit, most] = [limit + APPROACH, most + APPROACH];
+      }
       subgoal = sub.text;
-      robot.focus = sub.object;
+      robot.focus = sub.kind === "drive" ? null : sub.object;
       stage("observe");
-      const request: JevRequest =
-        sub.kind === "take"
-          ? { model, state: { goal, observation: observe(robot), history: history.slice(-4) }, questions: question("take") }
-          : { model, state: { goal, subgoal: sub.text, observation: observePlace(robot, sub), history: history.slice(-4) }, questions: question("place") };
+      const state = (observation: object) => ({ goal, ...(sub.kind !== "take" && sub.kind !== "drive" && { subgoal: sub.text }), observation, history: history.slice(-4) });
+      const request: JevRequest = {
+        model,
+        state: state(sub.kind === "take" ? observe(robot) : sub.kind === "place" ? observePlace(robot, sub) : sub.kind === "drive" ? observeDrive(robot, sub) : observeApproach(robot, sub)),
+        questions: question(sub.kind),
+      };
       emit({ type: "turn", turn, request, subgoal: sub.text });
 
       stage("jev");
@@ -426,16 +586,22 @@ export async function runAgent(options: {
           return end(result.success ? "success" : "done", `Jev chose done. ${result.text}`);
         }
         // A subgoal is over when code says so: done alone never skips one.
-        const result = await checkPlace(robot, task, sub);
+        const result = sub.kind === "place" ? await checkPlace(robot, task, sub) : { success: false, text: "" };
         const text = result.success ? "Checked." : `Not done yet: ${result.text}`;
         history.push({ command: answer.choice, result: text });
         emit({ type: "result", turn, command: answer.choice, text });
-      } else {
-        const before = robot.object().pos;
-        const grip = robot.contacts();
-        let text = await command.run(robot, stage, sub.kind === "place" ? sub.target : undefined);
+      } else if (BASE_COMMANDS.includes(answer.choice)) {
+        const text = await command.run(robot, stage, undefined, sub);
         if (signal.aborted) break;
-        const after = robot.object().pos;
+        history.push({ command: answer.choice, result: text });
+        emit({ type: "result", turn, command: answer.choice, text });
+      } else {
+        // In the world: a base move shifts every position seen from the arm, not only the object's.
+        const before = robot.object().world;
+        const grip = robot.contacts();
+        let text = await command.run(robot, stage, sub.kind === "place" ? sub.target : undefined, sub);
+        if (signal.aborted) break;
+        const after = robot.object().world;
         const moved = Math.hypot(after[0] - before[0], after[1] - before[1]);
         // Knocked, not carried.
         if (moved > 0.01 && !(grip.fixed && grip.moving) && !robot.contacts().moving) text += ` The object moved ${cm(moved)} cm.`;
@@ -452,7 +618,7 @@ export async function runAgent(options: {
         current = plan(robot, task);
         continue;
       }
-      const result = await checkPlace(robot, task, sub);
+      const result = sub.kind === "place" ? await checkPlace(robot, task, sub) : await checkBase(robot, sub);
       if (signal.aborted) break;
       emit({ type: "check", turn, ...result });
       const next = plan(robot, task);
@@ -473,7 +639,7 @@ export async function runAgent(options: {
     }
     if (signal.aborted) return end("stopped", `Stop pressed during turn ${turn}.`);
     const left = current.steps.filter((s) => !s.done).map((s) => s.text);
-    end("turns", `Stopped after ${limit} turns. ${task.kind === "take" ? `${task.object.label} not lifted.` : `Left: ${left.join(", ")}.`}`);
+    end("turns", `Stopped after ${limit} turns. ${current.current?.kind === "take" ? `${current.current.object.label} not lifted.` : `Left: ${left.join(", ")}.`}`);
   } catch (error) {
     if (signal.aborted) return end("stopped", `Stop pressed during turn ${turn}.`);
     end("error", error instanceof Error ? error.message : String(error));
@@ -501,12 +667,6 @@ function landingTurn(o: Obj, yaw: number, target: Target, pan: number) {
   const base = target.yaw + along - yaw;
   return base + step * Math.round((pan - base) / step);
 }
-
-// An angle wrapped to -180° to 180°.
-function wrap(angle: number) {
-  return angle - 2 * Math.PI * Math.round(angle / (2 * Math.PI));
-}
-
 
 // Straight line for the jaw tips, solved as IK waypoints. The jaws stay square to the target, or turn
 // from `yaw0` to `yaw1` along the way. `seed` is the joint pose it starts from. With `weight` TILT, each

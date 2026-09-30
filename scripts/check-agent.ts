@@ -4,7 +4,7 @@ import loadMujoco from "@mujoco/mujoco";
 import { readdirSync, readFileSync } from "node:fs";
 import { COMMANDS, maxTurns, observe, question, runAgent, type AgentEvent, type Decide, type JevRequest, type Observation } from "../src/agent";
 import { plan, type Task } from "../src/plan";
-import { createRobot, loadModel, type Obj, type Vec3 } from "../src/robot";
+import { STEP, TURN, createRobot, loadModel, type Obj, type Vec3 } from "../src/robot";
 import jevFunction from "../netlify/functions/jev";
 
 const dir = new URL("../model/", import.meta.url).pathname;
@@ -13,6 +13,8 @@ const files = ["scene_web.xml", "so101.xml", ...readdirSync(dir + "assets").map(
 );
 const mujoco = await loadMujoco();
 const robot = createRobot(mujoco, loadModel(mujoco, files));
+const heap = () => robot.data.qpos.buffer.byteLength; // the WASM memory: it grows, never shrinks
+const heapStart = heap();
 let failures = 0;
 const report = (ok: boolean, label: string, detail = "") => {
   if (!ok) failures++;
@@ -270,7 +272,7 @@ const labels = (sentParse?.state.objects as string[] | undefined) ?? [];
 report(
   end.outcome === "error" && /Not something this arm can do yet/.test(end.text) && !events.some((e) => e.type === "turn") &&
     labels.length === 2 && labels.every((l) => /^Box \d: a box, [\d.]+ x [\d.]+ x [\d.]+ cm, the /.test(l)) &&
-    Object.keys(sentParse!.questions).join() === "task,object,onto,order,spot",
+    Object.keys(sentParse!.questions).join() === "task,object,onto,order,spot,move,distance,angle",
   "an unsupported goal ends before any turn, and says what works",
   end.text,
 );
@@ -283,11 +285,13 @@ events = await loop(...stopAtFirstTurn(), "stack", reading("stack_boxes", {}, 0.
 const taskEvent = events.find((e) => e.type === "task") as Extract<AgentEvent, { type: "task" }>;
 report(taskEvent.confidence === 0.4 && taskEvent.maxTurns === 8 * 2 + 4, "a low-confidence reading is passed on with the turn budget", `confidence ${taskEvent.confidence}, ${taskEvent.maxTurns} turns`);
 
-// 9. Pick and place: a mock that reads the observation the way Jev's criteria describe.
+// 9. Pick and place: a mock that reads the observation the way Jev's criteria describe. Whatever is out of
+// the arm's reach, it drives up to.
 const placer: Decide = async ({ state }) => {
-  const o = state.observation as ReturnType<typeof observe> & { object_vs_target?: string };
+  const o = state.observation as ReturnType<typeof observe> & { object_vs_target?: string; destination?: string };
   return answer(
-    o.gripper_vs_object === "holding the object"
+    o.destination ? "drive_to_object"
+    : o.gripper_vs_object === "holding the object"
       ? o.object_vs_target === "away from the target" ? "move_above_target" : o.object_vs_target === "above the target" ? "lower_to_place" : "release"
       : o.gripper_vs_object === "open around the placed object" ? "retreat"
       : o.gripper_vs_object === "the object is between the jaws" ? "close_gripper"
@@ -366,7 +370,81 @@ events = await loop(...stopAtFirstTurn(), "stack", reading("stack_boxes"));
 const read = events.find((e) => e.type === "task") as Extract<AgentEvent, { type: "task" }>;
 report(/Box 4 stays out/.test(read.text) && read.maxTurns === maxTurns({ kind: "stack", objects: tall.slice(0, 3), spot: "here", skipped: [] }), "a tower over 10 cm leaves the last box out", read.text);
 
-// 10. The proxy: no key is refused locally, a wrong key reaches TypeSafe and comes back refused.
+// 10. The wheeled base: fixed steps with the wheel servos, Jev's drive commands, and driving up to what is out of reach.
+const pose = () => robot.base();
+const deg = (rad: number) => (rad * 180) / Math.PI;
+fresh();
+let p0 = pose();
+let base = await drive(robot.move("drive", STEP));
+let p1 = pose();
+const along = (p1.x - p0.x) * Math.cos(p0.yaw) + (p1.y - p0.y) * Math.sin(p0.yaw);
+report(Math.abs(along - STEP) < 0.01 && Math.abs(deg(p1.yaw - p0.yaw)) < 1 && !base.bumped, "drive forward one step moves the base about 10 cm", `${(along * 100).toFixed(1)} cm, heading ${deg(p1.yaw - p0.yaw).toFixed(1)}°`);
+p0 = pose();
+base = await drive(robot.move("turn", TURN));
+p1 = pose();
+report(Math.abs(deg(p1.yaw - p0.yaw) - 15) < 2 && Math.hypot(p1.x - p0.x, p1.y - p0.y) < 0.02, "turn left one step turns the base about 15°", `${deg(p1.yaw - p0.yaw).toFixed(1)}°, the arm's base shifted ${(Math.hypot(p1.x - p0.x, p1.y - p0.y) * 100).toFixed(1)} cm`);
+// Parked, the brake holds the base while the arm works.
+p0 = pose();
+robot.randomize(robot.focus!, random);
+await scriptedPick();
+p1 = pose();
+report(Math.hypot(p1.x - p0.x, p1.y - p0.y) < 0.001 && Math.abs(deg(p1.yaw - p0.yaw)) < 0.1, "the parked base holds still while the arm picks", `${(Math.hypot(p1.x - p0.x, p1.y - p0.y) * 1000).toFixed(2)} mm, ${deg(p1.yaw - p0.yaw).toFixed(2)}°`);
+// Driving into a box stops the base at the touch, and moving on from there still drives.
+fresh();
+robot.place(robot.focus!, 0.12, 0, 0);
+base = await drive(robot.move("drive", STEP));
+report(base.bumped === robot.focus && base.moved > 0.01 && base.moved < 0.05, "the base stops when it bumps into a box", `${(base.moved * 100).toFixed(1)} cm, touched ${base.bumped?.label ?? "nothing"}`);
+
+// Jev's drive commands, with a mock that reads the observation the way the criteria describe.
+const driver: Decide = async (request, signal) => {
+  const o = request.state.observation as { to_go?: string; destination?: string };
+  if (o.to_go) return answer(/forward/.test(o.to_go) ? "drive_forward" : /back/.test(o.to_go) ? "drive_backward" : /left/.test(o.to_go) ? "turn_left" : "turn_right");
+  return request.questions.next_command.criteria.lift ? reactive(request, signal) : placer(request, signal);
+};
+fresh();
+robot.remove(robot.focus!); // a clear floor ahead
+p0 = pose();
+events = await loop(driver, undefined, "go forward 20 cm", reading("drive", { move: "forward", distance: "20_cm" }));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+p1 = pose();
+let steps = events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : []));
+report(end.outcome === "success" && Math.abs(Math.hypot(p1.x - p0.x, p1.y - p0.y) - 0.2) < 0.01 && steps.join() === "drive_forward,drive_forward", "Jev drives forward 20 cm in two steps", `${steps.join(" > ")}: ${end.text}`);
+p0 = pose();
+events = await loop(driver, undefined, "turn left", reading("drive", { move: "left" }));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+p1 = pose();
+report(end.outcome === "success" && Math.abs(deg(p1.yaw - p0.yaw) - 15) < 2, "Jev turns left 15°", `${deg(p1.yaw - p0.yaw).toFixed(1)}°: ${end.text}`);
+// Drive, then pick: a box 60 cm away to the front left, out of reach.
+fresh();
+robot.place(robot.focus!, 0.55, 0.3, 0.4);
+robot.reset();
+events = await loop(driver, undefined, "drive to the box and pick it up", reading("take"));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+steps = events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : []));
+const drove = events.some((e) => e.type === "plan" && e.plan.steps[0]?.text === "Drive to Box 1");
+report(end.outcome === "success" && robot.held() && drove && steps[0] === "drive_to_object", "drive to a box out of reach, then pick it up", `${steps.join(" > ")}: ${end.text}`);
+// Put a far box on a near one: drive to it, take it, carry it back on the base, set it down.
+const [near, far] = scene(["box", "box"], false);
+robot.place(near, 0.2, 0.12, 0);
+robot.place(far, 0.6, -0.35, 0.3);
+robot.reset();
+events = await loop(driver, undefined, `put ${far.label} on ${near.label}`, reading("put_on", { object: far.label, onto: near.label }));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+steps = events.flatMap((e) => (e.type === "decision" ? [e.answer.choice] : []));
+report(end.outcome === "success" && steps.filter((c) => c === "drive_to_object").length === 2, "put a far box on a near one, driving both ways", `${steps.join(" > ")}: ${end.text}`);
+// Stacking still works after the base has moved: three boxes in front of the base where it now stands.
+scene(["box", "box", "box"], false);
+await drive(robot.move("turn", -2 * TURN));
+for (const o of robot.active()) robot.randomize(o, random);
+settle(0.5);
+events = await loop(placer, undefined, "stack all the boxes", reading("stack_boxes"));
+end = events.at(-1) as Extract<AgentEvent, { type: "end" }>;
+report(end.outcome === "success", "stack 3 boxes after the base has turned", end.text);
+// Every run above frees what it reads from the WASM heap.
+const growth = (heap() - heapStart) / 1e6;
+report(growth < 64, "WASM memory stays flat across all runs", `${(heapStart / 1e6).toFixed(0)} MB at start, +${growth.toFixed(0)} MB`);
+
+// 11. The proxy: no key is refused locally, a wrong key reaches TypeSafe and comes back refused.
 const local = await jevFunction(new Request("http://x/.netlify/functions/jev", { method: "POST", body: "{}" }));
 report(local.status === 401, "proxy without a key", `HTTP ${local.status}`);
 const upstream = await jevFunction(new Request("http://x/.netlify/functions/jev", { headers: { authorization: "Bearer not-a-key" } }));

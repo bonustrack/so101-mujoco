@@ -1,8 +1,8 @@
-// The scene editor: add boxes and balls, select one by clicking it, drag it along the table,
+// The scene editor: add boxes and balls, select one by clicking it, drag it along the floor,
 // resize or delete it. Physics stays in robot.ts; this file handles the pointer, the keys,
 // the selection ring and the Scene section of the right panel.
 import * as THREE from "three";
-import { SIZE_RANGE, type Kind, type Obj, type Robot, type Vec3 } from "./robot";
+import { BODY, SIZE_RANGE, type Kind, type Obj, type Robot, type Vec3 } from "./robot";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const cm = (m: number) => `${Math.round(m * 1000) / 10} cm`;
@@ -23,7 +23,7 @@ export function setupEditor(options: {
   let selected: Obj | null = null;
   let locked = false;
 
-  // A thin ring on the table around the selection.
+  // A thin ring on the floor around the selection.
   const ring = new THREE.Mesh(
     new THREE.RingGeometry(1, 1.08, 64),
     new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.45, depthWrite: false }),
@@ -57,7 +57,7 @@ export function setupEditor(options: {
       event.stopPropagation();
       canvas.setPointerCapture(event.pointerId);
       select(o);
-      const p = robot.object(o).pos;
+      const p = robot.object(o).world;
       drag = {
         o,
         id: event.pointerId,
@@ -92,12 +92,20 @@ export function setupEditor(options: {
   canvas.addEventListener("pointerup", release);
   canvas.addEventListener("pointercancel", release);
 
-  // Keep dragged objects on the table in front of the arm, clear of its base.
+  // Keep dragged objects on the floor within a metre of the robot, off its chassis and wheels.
   function move(o: Obj, x: number, y: number) {
-    const min = 0.07 + robot.footprint(o);
-    const r = Math.min(Math.max(Math.hypot(x, y), min), 0.45);
-    const a = Math.atan2(y, x);
-    robot.drag(o, r * Math.cos(a), r * Math.sin(a));
+    let [ax, ay] = robot.toArm([x, y, 0]);
+    const m = robot.footprint(o) + 0.005;
+    const out = [BODY.front + m - ax, ax - BODY.back + m, BODY.side + m - Math.abs(ay)];
+    if (out.every((d) => d > 0)) {
+      const side = out.indexOf(Math.min(...out));
+      if (side === 0) ax = BODY.front + m;
+      else if (side === 1) ax = BODY.back - m;
+      else ay = Math.sign(ay || 1) * (BODY.side + m);
+    }
+    const k = Math.min(1, 1 / Math.hypot(ax, ay));
+    const [wx, wy] = robot.toWorld([k * ax, k * ay, 0]);
+    robot.drag(o, wx, wy);
   }
 
   // Arrow keys nudge the selection along the view: up moves it away from the camera.
@@ -111,7 +119,7 @@ export function setupEditor(options: {
     const view = camera.getWorldDirection(new THREE.Vector3());
     const heading = Math.atan2(view.y, view.x) + (turn * Math.PI) / 2;
     const step = event.shiftKey ? 4 * NUDGE : NUDGE;
-    const p = robot.object(selected).pos;
+    const p = robot.object(selected).world;
     move(selected, p[0] + step * Math.cos(heading), p[1] + step * Math.sin(heading));
     robot.drop();
   });
@@ -211,7 +219,7 @@ export function setupEditor(options: {
     frame() {
       ring.visible = !!selected?.active;
       if (!selected?.active) return;
-      const p = robot.object(selected).pos;
+      const p = robot.object(selected).world;
       ring.position.set(p[0], p[1], 0.0008);
       ring.scale.setScalar(robot.footprint(selected) + 0.006);
     },

@@ -1,6 +1,10 @@
-// The SO-101 in MuJoCo without any drawing: physics, timed motions, inverse
-// kinematics and the scene facts the agent reads. main.ts draws it, and
+// The SO-101 on its wheeled base in MuJoCo, without any drawing: physics, timed motions, driving,
+// inverse kinematics and the scene facts the agent reads. main.ts draws it, and
 // scripts/check-agent.ts runs it headless with Bun.
+//
+// Frames: every position the agent reads or asks for is in the arm's frame on the floor: x forward,
+// y left, from the arm's base, z up from the floor. The arm rides on the chassis, so this frame moves
+// when the base drives. Only the editor and the drawing work in world coordinates.
 import type { MainModule, MjData, MjModel } from "@mujoco/mujoco";
 
 // One entry per position actuator, in the model's order.
@@ -13,8 +17,9 @@ export const JOINTS = [
   ["gripper", "Gripper"],
 ] as const;
 
-// Poses in radians, one value per joint (from examples/so101.py).
-export const REST = [0, -1.57, 1.57, 0.8, 0, 0];
+// Rest: folded, fingers down, the jaws 12 cm above the floor and 15 cm ahead, so the base can drive
+// over and up to objects without the arm touching them. Radians, one value per joint.
+export const REST = [0, -1.14, 0.92, 1.6, 0, 0];
 export const GRIPPER = 5;
 export const OPEN = 0.8; // jaws about 7 cm apart
 export const CLOSED = -0.17; // fully shut: the jaw stalls on whatever is between them
@@ -51,7 +56,19 @@ export const JAWS = 0.06;
 export const TALLEST = 0.06;
 const FIRST_BOX: [number, number, number] = [0.2, 0.08, 0]; // where the scene's first box starts
 const PARKED = [0, 0, -1, 1, 0, 0, 0]; // unused objects: 1 m below the floor, collisions off
-const DRAG_LIFT = 0.004; // a dragged object floats 4 mm above the table
+const DRAG_LIFT = 0.004; // a dragged object floats 4 mm above the floor
+
+// The wheeled base (model/scene_web.xml). One drive step is 10 cm, one turn step 15°.
+export const STEP = 0.1;
+export const TURN = (15 * Math.PI) / 180;
+// The robot's outline on the floor in the arm's frame, wheels included.
+export const BODY = { front: 0.08, back: -0.13, side: 0.095 };
+const WHEEL = 0.03; // wheel radius
+const TRACK = 0.17; // between the left and right wheels
+const SPEED = 0.12; // m/s when driving straight
+const SPIN = 3; // rad/s asked of the chassis when turning; the wheels skid sideways, so it turns slower
+const SETTLE = 0.3; // seconds the wheels hold still after a move
+export type Moved = { moved: number; turned: number; bumped: Obj | null };
 
 // Files are [name, bytes] pairs: scene_web.xml, so101.xml and the meshes under assets/.
 export function loadModel(mujoco: MainModule, files: [string, Uint8Array][]) {
@@ -84,6 +101,23 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   const jaw = id(obj.mjOBJ_BODY, "moving_jaw_so101_v1");
   const jacp = new mujoco.DoubleBuffer(3 * model.nv);
   const jacr = new mujoco.DoubleBuffer(3 * model.nv);
+  const chassis = id(obj.mjOBJ_BODY, "chassis");
+  const wheels = ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"].map((name) => ({ id: id(obj.mjOBJ_ACTUATOR, name), left: name.endsWith("l") }));
+  // Where the arm's frame stands on the floor, and where it faces (radians, counterclockwise from world x).
+  const base = () => {
+    const R = data.xmat.subarray(9 * chassis, 9 * chassis + 9);
+    return { x: data.xpos[3 * chassis] as number, y: data.xpos[3 * chassis + 1] as number, yaw: Math.atan2(R[3], R[0]) };
+  };
+  const toArm = (p: ArrayLike<number>): Vec3 => {
+    const { x, y, yaw } = base();
+    const [c, s, dx, dy] = [Math.cos(yaw), Math.sin(yaw), p[0] - x, p[1] - y];
+    return [c * dx + s * dy, -s * dx + c * dy, p[2]];
+  };
+  const toWorld = (p: ArrayLike<number>): Vec3 => {
+    const { x, y, yaw } = base();
+    const [c, s] = [Math.cos(yaw), Math.sin(yaw)];
+    return [x + c * p[0] - s * p[1], y + s * p[0] + c * p[1], p[2]];
+  };
 
   const objects: Obj[] = (["box", "ball"] as const).flatMap((kind) =>
     Array.from({ length: POOL }, (_, i) => {
@@ -104,7 +138,7 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       };
     }),
   );
-  // The arm's collision geoms, which a new object must not land on.
+  // The robot's collision geoms (arm, chassis and wheels), which a new object must not land on.
   const armGeoms = Array.from({ length: model.ngeom }, (_, g) => g).filter(
     (g) => model.geom_bodyid[g] > 0 && !objects.some((o) => o.geom === g) && (model.geom_contype[g] || model.geom_conaffinity[g]),
   );
@@ -113,12 +147,98 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   let added = 0;
   let dragged: { o: Obj; pose: number[] } | null = null;
   let motion: { path: number[][]; start: number; duration: number; settle: number; done: () => void; until?: () => boolean } | null = null;
+  // A base move: its start pose, how far it has turned so far, and when it stopped (-1 while it runs).
+  type Rolling = { kind: "drive" | "turn"; amount: number; x: number; y: number; yaw: number; last: number; turned: number; start: number; stopped: number; before: Set<Obj>; bumped: Obj | null; done: (moved: Moved) => void };
+  let rolling: Rolling | null = null;
+  let ticks = 0;
+  // Parked, the base is braked: the "brake" weld in scene_web.xml holds the chassis where it stopped. Driving
+  // turns it off.
+  const chassisQpos = model.jnt_qposadr[model.body_jntadr[chassis]] as number;
+  const brake = id(obj.mjOBJ_EQUALITY, "brake");
+  const EQUALITY = mujoco.mjtDisableBit.mjDSBL_EQUALITY.value;
+  const park = () => {
+    wheelSpeeds(0, 0);
+    const [x, y, z, w, qx, qy, qz] = data.qpos.subarray(chassisQpos, chassisQpos + 7);
+    // The weld holds the world's pose as seen from the chassis: the chassis pose, inverted.
+    const inverse = [w, -qx, -qy, -qz];
+    model.eq_data.set([0, 0, 0, ...rotate([-x, -y, -z], inverse), ...inverse, 1], 11 * brake);
+    model.opt.disableflags &= ~EQUALITY;
+  };
+  const release = () => (model.opt.disableflags |= EQUALITY);
 
   // Write a free joint's pose (x y z and quaternion) and stop it.
   const pin = (o: Obj, pose: number[]) => {
     data.qpos.set(pose, o.qpos);
     data.qvel.fill(0, o.dof, o.dof + 6);
   };
+  const wheelSpeeds = (v: number, w: number) => {
+    for (const { id, left } of wheels) data.ctrl[id] = (v + (left ? -w : w) * (TRACK / 2)) / WHEEL;
+  };
+  // The objects the robot touches right now, other than one gripped by both jaws. One pass over the contacts.
+  const bumping = () => {
+    const touched = new Set<Obj>();
+    const gripped = new Map<Obj, number>();
+    const contacts = data.contact;
+    for (let i = 0; i < data.ncon; i++) {
+      const c = contacts.get(i);
+      if (!c) continue;
+      const [a, b] = [byGeom.get(c.geom1), byGeom.get(c.geom2)];
+      const o = a ?? b;
+      const other = a ? c.geom2 : c.geom1;
+      if (o && o.active && armGeoms.includes(other)) {
+        touched.add(o);
+        const body = model.geom_bodyid[other];
+        if (body === hand) gripped.set(o, (gripped.get(o) ?? 0) | 1);
+        if (body === jaw) gripped.set(o, (gripped.get(o) ?? 0) | 2);
+      }
+      c.delete();
+    }
+    contacts.delete();
+    for (const [o, jaws] of gripped) if (jaws === 3) touched.delete(o);
+    return touched;
+  };
+  // How far the current base move has gone: along its start heading, and turned.
+  const progress = (r: Rolling): Moved => {
+    const b = base();
+    return { moved: (b.x - r.x) * Math.cos(r.yaw) + (b.y - r.y) * Math.sin(r.yaw), turned: r.turned, bumped: r.bumped };
+  };
+  // One control tick of a base move: wheel speeds from the chassis pose, a feedback loop that ramps up,
+  // cruises, slows down on the target and holds the heading when driving straight. It stops on target,
+  // on a timeout, or when the robot bumps into an object it was not touching at the start.
+  const roll = (r: Rolling) => {
+    const b = base();
+    r.turned += wrap(b.yaw - r.last);
+    r.last = b.yaw;
+    const t = data.time - r.start;
+    const drive = r.kind === "drive";
+    const left = r.amount - (drive ? progress(r).moved : r.turned);
+    // Near the target, the floor speed keeps the wheels turning against the skid; once there, only a soft pull remains.
+    const near = r.stopped >= 0;
+    const speed = (cap: number, gain: number, floor: number) => Math.sign(left) * Math.min(cap, gain * Math.abs(left) + (near ? 0 : floor));
+    let v = drive ? speed(Math.min(SPEED, 0.4 * t + 0.02), 3, 0.01) : 0;
+    let w = drive ? -8 * r.turned : speed(Math.min(SPIN, 3 * t + 0.2), 6, 0.15);
+    if (!near) {
+      if (Math.abs(left) < (drive ? 0.002 : 0.004)) r.stopped = data.time;
+      if (t > 2 + 1.5 * Math.abs(r.amount) * (drive ? 1 / SPEED : 1)) r.stopped = data.time;
+      if (r.stopped < 0 && ticks % 4 === 0) {
+        const hit = [...bumping()].find((o) => !r.before.has(o));
+        if (hit) {
+          r.bumped = hit;
+          r.stopped = data.time;
+          v = w = 0;
+        }
+      }
+    }
+    if (r.bumped) v = w = 0;
+    wheelSpeeds(v, w);
+    if (r.stopped >= 0 && data.time - r.stopped >= SETTLE) {
+      rolling = null;
+      park();
+      r.done(progress(r));
+    }
+  };
+  // An object's heading in the world.
+  const heading = (o: Obj) => Math.atan2(data.xmat[9 * o.body + 3], data.xmat[9 * o.body]);
   const upright = (o: Obj, x: number, y: number, yaw: number, lift: number) => [
     x,
     y,
@@ -167,10 +287,13 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     },
     joints: () => actuators.map(({ qpos }) => data.qpos[qpos] as number),
 
-    // One physics step. Unused and dragged objects are held in place; a running motion sets the actuator targets.
+    // One physics step. Unused and dragged objects are held in place; a running motion sets the actuator targets,
+    // a running base move the wheel speeds.
     step() {
       for (const o of objects) if (!o.active) pin(o, PARKED);
       if (dragged) pin(dragged.o, dragged.pose);
+      ticks++;
+      if (rolling) roll(rolling);
       if (motion) {
         const t = data.time - motion.start;
         const k = Math.min(t / motion.duration, 1);
@@ -193,23 +316,52 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     // Glide the actuator targets through `path` (full 6-joint targets), then hold for `settle` seconds.
     // Resolves in simulated time, so it works the same live and headless. `until`, checked every step, ends the glide early.
     play(path: number[][], duration: number, settle = 0.25, until?: () => boolean) {
-      robot.cancel();
+      robot.stopArm();
       return new Promise<void>((done) => {
         motion = { path: [[...robot.target], ...path], start: data.time, duration: Math.max(duration, 1e-3), settle, done, until };
       });
     },
     hold: (seconds: number) => robot.play([[...robot.target]], 1e-3, seconds),
-    cancel() {
+    stopArm() {
       const done = motion?.done;
       motion = null;
       done?.();
     },
+    stopBase() {
+      const r = rolling;
+      rolling = null;
+      park();
+      r?.done(progress(r));
+    },
+    // Stop everything: the arm where it is, the wheels at once.
+    cancel() {
+      robot.stopArm();
+      robot.stopBase();
+    },
 
-    // Arm back to rest and every object back to where it was placed.
+    // The base: drive `amount` metres straight ahead (negative: back), or turn `amount` radians on the spot
+    // (positive: left). The arm holds its pose meanwhile. Resolves in simulated time, once the wheels have
+    // held still for 0.3 s, with how far it went and the object it bumped into, if any.
+    move(kind: "drive" | "turn", amount: number) {
+      robot.stopBase();
+      return new Promise<Moved>((done) => {
+        const { x, y, yaw } = base();
+        rolling = { kind, amount, x, y, yaw, last: yaw, turned: 0, start: data.time, stopped: -1, before: bumping(), bumped: null, done };
+        release();
+      });
+    },
+    base,
+    toArm,
+    toWorld,
+    // A point in the arm's frame: how far from the arm's base, and its angle, left positive.
+    polar: (p: ArrayLike<number>) => ({ r: Math.hypot(p[0], p[1]), a: Math.atan2(p[1], p[0]) }),
+
+    // Arm back to rest, the base back to its start and every object back to where it was placed.
     reset() {
       robot.cancel();
       dragged = null;
       mujoco.mj_resetData(model, data);
+      park();
       actuators.forEach(({ qpos }, i) => (data.qpos[qpos] = REST[i]));
       robot.setCtrl(REST);
       for (const o of objects) pin(o, o.active ? upright(o, ...o.home, 0.001) : PARKED);
@@ -255,16 +407,18 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       data.qvel.fill(0, o.dof, o.dof + 6);
       mujoco.mj_forward(model, data);
     },
-    // Put an object upright at (x, y), turned by `yaw` radians, `lift` above the table. Reset brings it back here.
+    // Put an object upright at (x, y) in the arm's frame, turned by `yaw` radians, `lift` above the floor.
+    // Reset brings it back to this spot on the floor, wherever the base is then.
     place(o: Obj, x: number, y: number, yaw: number, lift = 0.001) {
-      o.home = [x, y, yaw];
-      pin(o, upright(o, x, y, yaw, lift));
+      const [wx, wy] = toWorld([x, y, 0]);
+      o.home = [wx, wy, yaw + base().yaw];
+      pin(o, upright(o, ...o.home, lift));
       mujoco.mj_forward(model, data);
     },
-    // Hold an object upright just above the table at (x, y) while the pointer drags it: the physics
+    // Hold an object upright just above the floor at world (x, y) while the pointer drags it: the physics
     // keeps running around it, and it pushes what it meets. drop() lets it fall and settle.
     drag(o: Obj, x: number, y: number) {
-      const yaw = dragged?.o === o ? robot.object(o).yaw : o.kind === "box" ? robot.object(o).yaw : 0;
+      const yaw = dragged?.o === o || o.kind === "box" ? heading(o) : 0;
       dragged = { o, pose: upright(o, x, y, yaw, DRAG_LIFT) };
       pin(o, dragged.pose);
       mujoco.mj_forward(model, data);
@@ -273,17 +427,17 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       if (!dragged) return;
       const { o, pose } = dragged;
       dragged = null;
-      o.home = [pose[0], pose[1], robot.object(o).yaw];
+      o.home = [pose[0], pose[1], heading(o)];
       data.qvel.fill(0, o.dof, o.dof + 6);
     },
-    // How much room `o` would have at (x, y): the gap to the nearest other object or arm part it could touch.
-    // Negative when it would overlap one. The arm counts where it stands now, unless `arm` is false.
+    // How much room `o` would have at (x, y): the gap to the nearest other object or robot part it could touch.
+    // Negative when it would overlap one. The robot counts where it stands now, unless `arm` is false.
     roomFinder(o: Obj, arm = true) {
       const height = 2 * o.size[2] + 0.03;
       const obstacles = [
         ...robot.active().flatMap((other) => (other === o ? [] : [[...robot.object(other).pos, robot.footprint(other)]])),
         ...(arm ? armGeoms : []).flatMap((g) => {
-          const p = data.geom_xpos.subarray(3 * g, 3 * g + 3);
+          const p = toArm(data.geom_xpos.subarray(3 * g, 3 * g + 3));
           const r = model.geom_rbound[g];
           return p[2] - r < height ? [[p[0], p[1], p[2], r]] : [];
         }),
@@ -330,29 +484,36 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       return null;
     },
 
-    // Scene facts, all computed from the physics state.
+    // Scene facts, all computed from the physics state, in the arm's frame. `world` is for the editor.
     object(target?: Obj) {
       const o = target ?? robot.focus!;
-      const p = data.xpos.subarray(3 * o.body, 3 * o.body + 3);
+      const world = Array.from(data.xpos.subarray(3 * o.body, 3 * o.body + 3)) as Vec3;
+      const p = toArm(world);
       const R = data.xmat.subarray(9 * o.body, 9 * o.body + 9);
       const [a, b, c] = o.size;
       const ball = o.kind === "ball";
       // Lowest point: half extents projected on the vertical.
       const bottom = p[2] - (ball ? a : Math.abs(R[6]) * a + Math.abs(R[7]) * b + Math.abs(R[8]) * c);
       return {
-        pos: [p[0], p[1], p[2]] as Vec3,
+        pos: p,
+        world,
         // A ball has no faces: the jaws line up with the direction from the base instead.
-        yaw: ball ? Math.atan2(p[1], p[0]) : Math.atan2(R[3], R[0]),
+        yaw: ball ? Math.atan2(p[1], p[0]) : wrap(heading(o) - base().yaw),
         upright: ball || R[8] > 0.95,
         bottom,
         top: 2 * p[2] - bottom,
       };
     },
-    tcp: () => Array.from(data.site_xpos.subarray(3 * tcp, 3 * tcp + 3)) as Vec3,
+    tcp: () => toArm(data.site_xpos.subarray(3 * tcp, 3 * tcp + 3)),
     // Direction the jaws close along, as a heading in radians.
-    handYaw: () => Math.atan2(data.xmat[9 * hand + 3], data.xmat[9 * hand]),
+    handYaw: () => wrap(Math.atan2(data.xmat[9 * hand + 3], data.xmat[9 * hand]) - base().yaw),
     // Which jaws touch the target right now, and whether any part of the arm does.
     contacts: () => robot.touching(robot.focus),
+    // Held between both jaws.
+    gripped: (o: Obj) => {
+      const t = robot.touching(o);
+      return t.fixed && t.moving;
+    },
     // Everything that touches `o` right now: each jaw, any arm part, other objects, the table.
     touching(o: Obj | null) {
       let fixed = false;
@@ -385,7 +546,7 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
     speed: (o: Obj) => Math.hypot(...data.qvel.subarray(o.dof, o.dof + 3)),
     // Target centre in the hand frame: x across the jaws, z along the fingers (tips near z = -0.1).
     objectInHand() {
-      const p = robot.object().pos;
+      const p = robot.object().world;
       const o = data.xpos.subarray(3 * hand, 3 * hand + 3);
       const R = data.xmat.subarray(9 * hand, 9 * hand + 9);
       const d = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
@@ -397,15 +558,18 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
       return robot.object().bottom >= LIFTED && fixed && moving;
     },
 
-    // Inverse kinematics: arm joints that put the jaw tips at `pos` with the fingers pointing
+    // Inverse kinematics: arm joints that put the jaw tips at `target` with the fingers pointing
     // straight down and the jaws closing along `yaw`. Damped least squares on mj_jacSite.
     // A lower `weight` trades wrist pitch for position when the pose is out of reach.
-    solve(pos: Vec3, yaw: number, seed: number[] = robot.joints(), weight = 0.3) {
+    solve(target: Vec3, yaw: number, seed: number[] = robot.joints(), weight = 0.3) {
       scratch.qpos.set(data.qpos);
       actuators.slice(0, ARM).forEach(({ qpos }, i) => (scratch.qpos[qpos] = seed[i]));
+      // The IK works in the world, where the arm stands now.
+      const pos = toWorld(target);
+      const turn = yaw + base().yaw;
       const want = [
-        [Math.cos(yaw), Math.sin(yaw), 0], // hand x: across the jaws
-        [-Math.sin(yaw), Math.cos(yaw), 0], // hand y
+        [Math.cos(turn), Math.sin(turn), 0], // hand x: across the jaws
+        [-Math.sin(turn), Math.cos(turn), 0], // hand y
         [0, 0, 1], // hand z: fingers point down
       ];
       const W = weight; // orientation weight against metres of position error
@@ -499,6 +663,17 @@ export function createRobot(mujoco: MainModule, model: MjModel) {
   robot.resetScene();
   robot.reset();
   return robot;
+}
+
+// An angle wrapped to -180° to 180°.
+export function wrap(angle: number) {
+  return angle - 2 * Math.PI * Math.round(angle / (2 * Math.PI));
+}
+
+// v turned by the unit quaternion q = (w, x, y, z).
+function rotate([vx, vy, vz]: number[], [w, x, y, z]: number[]) {
+  const [tx, ty, tz] = [2 * (y * vz - z * vy), 2 * (z * vx - x * vz), 2 * (x * vy - y * vx)];
+  return [vx + w * tx + y * tz - z * ty, vy + w * ty + z * tx - x * tz, vz + w * tz + x * ty - y * tx];
 }
 
 // Solve (JᵀJ + λ²I) dq = Jᵀe for a small dense J (rows x n).

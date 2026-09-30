@@ -340,6 +340,39 @@ input[type="range"]:disabled {
   cursor: default;
 }
 
+/* Drive */
+#base-pose {
+  font-weight: 400;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.drive {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--gap);
+  align-items: center;
+}
+
+#pad {
+  display: grid;
+  grid-template-columns: repeat(3, 28px);
+  gap: 4px;
+}
+
+#pad .up {
+  grid-column: 2;
+}
+
+#pad button:first-child + button {
+  grid-column: 1;
+}
+
+.drive .note {
+  margin: 0;
+}
+
 /* Scene */
 .scene-buttons,
 .buttons {
